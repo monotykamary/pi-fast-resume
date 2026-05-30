@@ -14,13 +14,24 @@
  * Keys in picker (identical to /resume):
  *   ↑/↓                   Navigate
  *   Tab                   Toggle scope (Current Folder / All)
+ *   Ctrl+S                Toggle sort (Threaded / Recent / Fuzzy)
+ *   Ctrl+N                Toggle name filter (All / Named)
+ *   Ctrl+P                Toggle session path display
+ *   Ctrl+D                Delete session (with confirmation)
+ *   Ctrl+R                Rename session
  *   Enter                 Select session
  *   Esc                   Cancel
  *   typing                Filter sessions by text search
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { DynamicBorder, Theme, keyHint, keyText } from "@earendil-works/pi-coding-agent";
+import {
+  DynamicBorder,
+  keyHint,
+  keyText,
+  SessionManager,
+  Theme,
+} from "@earendil-works/pi-coding-agent";
 import {
   Container,
   type Component,
@@ -33,7 +44,10 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
+import { existsSync } from "node:fs";
+import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
+import { spawnSync } from "node:child_process";
 import {
   scanAllSessionDirs,
   scanSessionDir,
@@ -52,6 +66,10 @@ export interface FastResumeResult {
   sessionPath?: string;
   cancelled: boolean;
 }
+
+type SortMode = "threaded" | "recent" | "fuzzy";
+type NameFilter = "all" | "named";
+type StatusMessage = { type: "info" | "error"; message: string };
 
 // Helpers
 
@@ -78,19 +96,83 @@ function formatSessionDate(date: Date): string {
   return `${Math.floor(diffDays / 365)}y`;
 }
 
-// Header — mirrors SessionSelectorHeader layout exactly:
-// Line 1: Title (left) │ Scope indicators + loading progress (right)
+function hasSessionName(session: SessionHeader): boolean {
+  return Boolean(session.name?.trim());
+}
+
+async function deleteSessionFile(sessionPath: string): Promise<{ ok: boolean; method?: string; error?: string }> {
+  // Try `trash` first (if installed)
+  const trashArgs = sessionPath.startsWith("-") ? ["--", sessionPath] : [sessionPath];
+  const trashResult = spawnSync("trash", trashArgs, { encoding: "utf-8" });
+
+  const getTrashErrorHint = () => {
+    const parts: string[] = [];
+    if (trashResult.error) {
+      parts.push(trashResult.error.message);
+    }
+    const stderr = trashResult.stderr?.trim();
+    if (stderr) {
+      parts.push(stderr.split("\n")[0] ?? stderr);
+    }
+    if (parts.length === 0) return null;
+    return `trash: ${parts.join(" · ").slice(0, 200)}`;
+  };
+
+  if (trashResult.status === 0 || !existsSync(sessionPath)) {
+    return { ok: true, method: "trash" };
+  }
+
+  // Fallback to permanent deletion
+  try {
+    await unlink(sessionPath);
+    return { ok: true, method: "unlink" };
+  } catch (err) {
+    const unlinkError = err instanceof Error ? err.message : String(err);
+    const trashErrorHint = getTrashErrorHint();
+    const error = trashErrorHint ? `${unlinkError} (${trashErrorHint})` : unlinkError;
+    return { ok: false, method: "unlink", error };
+  }
+}
+
+// Header — mirrors SessionSelectorHeader exactly:
+// Line 1: Title (left) │ Scope + Name + Sort indicators (right)
 // Line 2: Hint line 1 (scope toggle + search hints)
-// Line 3: Hint line 2 (sort/delete/path — minimal for fast-resume)
+// Line 3: Hint line 2 (sort/named/delete/path/rename)
 
 class FastResumeHeader implements Component {
   private theme: Theme;
   scope: PickerScope = "current";
+  sortMode: SortMode = "threaded";
+  nameFilter: NameFilter = "all";
   loading = false;
   loadProgress: { loaded: number; total: number } | null = null;
+  showPath = false;
+  confirmingDeletePath: string | null = null;
+  statusMessage: StatusMessage | null = null;
+  private statusTimeout: ReturnType<typeof setTimeout> | null = null;
+  showRenameHint = true;
+  private requestRender: () => void;
 
-  constructor(theme: Theme) {
+  constructor(theme: Theme, requestRender: () => void) {
     this.theme = theme;
+    this.requestRender = requestRender;
+  }
+
+  clearStatusTimeout(): void {
+    if (!this.statusTimeout) return;
+    clearTimeout(this.statusTimeout);
+    this.statusTimeout = null;
+  }
+
+  setStatusMessage(msg: StatusMessage | null, autoHideMs?: number): void {
+    this.clearStatusTimeout();
+    this.statusMessage = msg;
+    if (!msg || !autoHideMs) return;
+    this.statusTimeout = setTimeout(() => {
+      this.statusMessage = null;
+      this.statusTimeout = null;
+      this.requestRender();
+    }, autoHideMs);
   }
 
   invalidate(): void {}
@@ -103,7 +185,7 @@ class FastResumeHeader implements Component {
       ? t.bold("Resume Session (Current Folder)")
       : t.bold("Resume Session (All)");
 
-    // Scope indicators (right side)
+    // Right side: scope indicators + name filter + sort mode
     let scopeText: string;
     if (this.loading) {
       const progressText = this.loadProgress
@@ -116,20 +198,50 @@ class FastResumeHeader implements Component {
       scopeText = `${t.fg("muted", "○ Current Folder | ")}${t.fg("accent", "◉ All")}`;
     }
 
-    const rightText = truncateToWidth(scopeText, width, "");
+    const sortLabel = this.sortMode === "threaded" ? "Threaded" : this.sortMode === "recent" ? "Recent" : "Fuzzy";
+    const sortText = t.fg("muted", "Sort: ") + t.fg("accent", sortLabel);
+
+    const nameLabel = this.nameFilter === "all" ? "All" : "Named";
+    const nameText = t.fg("muted", "Name: ") + t.fg("accent", nameLabel);
+
+    const rightText = truncateToWidth(`${scopeText}  ${nameText}  ${sortText}`, width, "");
     const availableLeft = Math.max(0, width - visibleWidth(rightText) - 1);
     const left = truncateToWidth(title, availableLeft, "");
     const spacing = Math.max(0, width - visibleWidth(left) - visibleWidth(rightText));
 
-    // Hint lines — same style as built-in selector
-    const sep = t.fg("muted", " · ");
-    const hint1 = keyHint("tui.input.tab", "scope") + sep + t.fg("muted", 're:<pattern> regex · "phrase" exact');
-    const hint2 = keyHint("tui.select.confirm", "select") + sep + keyHint("tui.select.cancel", "cancel");
+    // Hint lines — same logic as built-in SessionSelectorHeader
+    let hintLine1: string;
+    let hintLine2: string;
+
+    if (this.confirmingDeletePath !== null) {
+      const confirmHint = `Delete session? ${keyHint("tui.select.confirm", "confirm")} · ${keyHint("tui.select.cancel", "cancel")}`;
+      hintLine1 = t.fg("error", truncateToWidth(confirmHint, width, "…"));
+      hintLine2 = "";
+    } else if (this.statusMessage) {
+      const color = this.statusMessage.type === "error" ? "error" : "accent";
+      hintLine1 = t.fg(color, truncateToWidth(this.statusMessage.message, width, "…"));
+      hintLine2 = "";
+    } else {
+      const pathState = this.showPath ? "(on)" : "(off)";
+      const sep = t.fg("muted", " · ");
+      const hint1 = keyHint("tui.input.tab", "scope") + sep + t.fg("muted", 're:<pattern> regex · "phrase" exact');
+      const hint2Parts = [
+        keyHint("app.session.toggleSort", "sort"),
+        keyHint("app.session.toggleNamedFilter", "named"),
+        keyHint("app.session.delete", "delete"),
+        keyHint("app.session.togglePath", `path ${pathState}`),
+      ];
+      if (this.showRenameHint) {
+        hint2Parts.push(keyHint("app.session.rename", "rename"));
+      }
+      hintLine1 = truncateToWidth(hint1, width, "…");
+      hintLine2 = truncateToWidth(hint2Parts.join(sep), width, "…");
+    }
 
     return [
       `${left}${" ".repeat(spacing)}${rightText}`,
-      truncateToWidth(hint1, width, "…"),
-      truncateToWidth(hint2, width, "…"),
+      hintLine1,
+      hintLine2,
     ];
   }
 }
@@ -144,12 +256,23 @@ class FastResumeSessionList implements Component {
   selectedIndex = 0;
   searchInput: Input;
   showCwd = false;
+  showPath = false;
+  sortMode: SortMode = "threaded";
+  nameFilter: NameFilter = "all";
+  confirmingDeletePath: string | null = null;
   maxVisible = 10;
   currentSessionPath: string | undefined;
 
   onSelect?: (sessionPath: string) => void;
   onCancel?: () => void;
   onToggleScope?: () => void;
+  onToggleSort?: () => void;
+  onToggleNameFilter?: () => void;
+  onTogglePath?: (showPath: boolean) => void;
+  onDeleteConfirmationChange?: (path: string | null) => void;
+  onDeleteSession?: (sessionPath: string) => void;
+  onRenameSession?: (sessionPath: string) => void;
+  onError?: (msg: string) => void;
 
   private _focused = false;
   get focused() { return this._focused; }
@@ -170,23 +293,60 @@ class FastResumeSessionList implements Component {
     };
   }
 
+  setSortMode(sortMode: SortMode): void {
+    this.sortMode = sortMode;
+    this.filterSessions(this.searchInput.getValue());
+  }
+
+  setNameFilter(nameFilter: NameFilter): void {
+    this.nameFilter = nameFilter;
+    this.filterSessions(this.searchInput.getValue());
+  }
+
   setSessions(sessions: SessionHeader[], showCwd: boolean): void {
     this.allSessions = sessions;
     this.showCwd = showCwd;
     this.filterSessions(this.searchInput.getValue());
   }
 
+  setConfirmingDeletePath(path: string | null): void {
+    this.confirmingDeletePath = path;
+    this.onDeleteConfirmationChange?.(path);
+  }
+
+  startDeleteConfirmationForSelectedSession(): void {
+    const selected = this.filteredSessions[this.selectedIndex];
+    if (!selected) return;
+    if (selected.path === this.currentSessionPath) {
+      this.onError?.("Cannot delete the currently active session");
+      return;
+    }
+    this.setConfirmingDeletePath(selected.path);
+  }
+
+  private applyNameFilter(sessions: SessionHeader[]): SessionHeader[] {
+    if (this.nameFilter === "all") return sessions;
+    return sessions.filter(hasSessionName);
+  }
+
   filterSessions(query: string): void {
+    const nameFiltered = this.applyNameFilter(this.allSessions);
     const trimmed = query.trim();
+
     if (trimmed) {
+      // With a query, fuzzyFilter handles relevance scoring
       this.filteredSessions = fuzzyFilter(
-        this.allSessions,
+        nameFiltered,
         trimmed,
         (s) => `${s.name ?? ""} ${s.firstMessage} ${s.cwd} ${s.id}`,
       );
     } else {
-      this.filteredSessions = [...this.allSessions];
+      // No query: respect sort mode
+      // "threaded" and "recent" both keep mtime order (descending)
+      // "fuzzy" also keeps mtime order (no query to score by)
+      this.filteredSessions = [...nameFiltered];
     }
+
     this.selectedIndex = Math.min(
       this.selectedIndex,
       Math.max(0, this.filteredSessions.length - 1),
@@ -207,7 +367,14 @@ class FastResumeSessionList implements Component {
 
     if (this.filteredSessions.length === 0) {
       let emptyMessage: string;
-      if (this.showCwd) {
+      if (this.nameFilter === "named") {
+        const toggleKey = keyText("app.session.toggleNamedFilter");
+        if (this.showCwd) {
+          emptyMessage = `  No named sessions found. Press ${toggleKey} to show all.`;
+        } else {
+          emptyMessage = `  No named sessions in current folder. Press ${toggleKey} to show all, or Tab to view all.`;
+        }
+      } else if (this.showCwd) {
         emptyMessage = "  No sessions found";
       } else {
         emptyMessage = "  No sessions in current folder. Press Tab to view all.";
@@ -229,6 +396,7 @@ class FastResumeSessionList implements Component {
     for (let i = startIndex; i < endIndex; i++) {
       const session = this.filteredSessions[i]!;
       const isSelected = i === this.selectedIndex;
+      const isConfirmingDelete = session.path === this.confirmingDeletePath;
       const isCurrent = session.path === this.currentSessionPath;
       const hasName = !!session.name;
 
@@ -237,12 +405,15 @@ class FastResumeSessionList implements Component {
         .replace(/[\x00-\x1f\x7f]/g, " ")
         .trim();
 
-      // Right side: cwd (if all scope) + message count + age
+      // Right side: path (if toggled) + cwd (if all scope) + message count + age
       const age = formatSessionDate(session.modified);
       const msgCount = String(session.messageCount);
       let rightPart = `${msgCount} ${age}`;
       if (this.showCwd && session.cwd) {
         rightPart = `${shortenPath(session.cwd)} ${rightPart}`;
+      }
+      if (this.showPath) {
+        rightPart = `${shortenPath(session.path)} ${rightPart}`;
       }
 
       // Cursor
@@ -255,7 +426,9 @@ class FastResumeSessionList implements Component {
 
       // Style message — same color logic as built-in
       let messageColor: Parameters<Theme["fg"]>[0] | null = null;
-      if (isCurrent) {
+      if (isConfirmingDelete) {
+        messageColor = "error";
+      } else if (isCurrent) {
         messageColor = "accent";
       } else if (hasName) {
         messageColor = "warning";
@@ -269,7 +442,7 @@ class FastResumeSessionList implements Component {
       const leftPart = cursor + styledMsg;
       const leftWidth = visibleWidth(leftPart);
       const spacing = Math.max(1, width - leftWidth - visibleWidth(rightPart));
-      const styledRight = t.fg("dim", rightPart);
+      const styledRight = t.fg(isConfirmingDelete ? "error" : "dim", rightPart);
       let line = leftPart + " ".repeat(spacing) + styledRight;
       if (isSelected) {
         line = t.bg("selectedBg", line);
@@ -289,8 +462,67 @@ class FastResumeSessionList implements Component {
   handleInput(data: string): void {
     const kb = getKeybindings();
 
+    // Handle delete confirmation state first — intercept all keys
+    if (this.confirmingDeletePath !== null) {
+      if (kb.matches(data, "tui.select.confirm")) {
+        const pathToDelete = this.confirmingDeletePath;
+        this.setConfirmingDeletePath(null);
+        this.onDeleteSession?.(pathToDelete);
+        return;
+      }
+      if (kb.matches(data, "tui.select.cancel")) {
+        this.setConfirmingDeletePath(null);
+        return;
+      }
+      // Ignore all other keys while confirming
+      return;
+    }
+
     if (kb.matches(data, "tui.input.tab")) {
       this.onToggleScope?.();
+      return;
+    }
+
+    if (kb.matches(data, "app.session.toggleSort")) {
+      this.onToggleSort?.();
+      return;
+    }
+
+    if (kb.matches(data, "app.session.toggleNamedFilter")) {
+      this.onToggleNameFilter?.();
+      return;
+    }
+
+    // Ctrl+P: toggle path display
+    if (kb.matches(data, "app.session.togglePath")) {
+      this.showPath = !this.showPath;
+      this.onTogglePath?.(this.showPath);
+      return;
+    }
+
+    // Ctrl+D: initiate delete confirmation
+    if (kb.matches(data, "app.session.delete")) {
+      this.startDeleteConfirmationForSelectedSession();
+      return;
+    }
+
+    // Ctrl+R: rename selected session
+    if (kb.matches(data, "app.session.rename")) {
+      const selected = this.filteredSessions[this.selectedIndex];
+      if (selected) {
+        this.onRenameSession?.(selected.path);
+      }
+      return;
+    }
+
+    // Ctrl+Backspace: convenience alias for delete when search is empty
+    if (kb.matches(data, "app.session.deleteNoninvasive")) {
+      if (this.searchInput.getValue().length > 0) {
+        this.searchInput.handleInput(data);
+        this.filterSessions(this.searchInput.getValue());
+        return;
+      }
+      this.startDeleteConfirmationForSelectedSession();
       return;
     }
 
@@ -319,15 +551,19 @@ class FastResumeSessionList implements Component {
 
 // Top-level component — mirrors SessionSelectorComponent layout exactly:
 // Spacer(1) → DynamicBorder → Spacer(1) → Header → Spacer(1) → SessionList → Spacer(1) → DynamicBorder
+// Or, when in rename mode: same layout wrapping a rename panel
 
 class FastResumePicker extends Container {
   private header: FastResumeHeader;
   private sessionList: FastResumeSessionList;
+  private renameInput: Input;
   private theme: Theme;
   private tuiRequestRender: () => void;
   private done: (result: FastResumeResult) => void;
 
   private scope: PickerScope = "current";
+  private sortMode: SortMode = "threaded";
+  private nameFilter: NameFilter = "all";
   private currentSessions: SessionHeader[] | null = null;
   private allSessions: SessionHeader[] | null = null;
   private currentLoading = false;
@@ -337,12 +573,33 @@ class FastResumePicker extends Container {
   private loadingAbort: AbortController | null = null;
   private allLoadSeq = 0;
 
-  // Focusable — propagate to sessionList
+  private mode: "list" | "rename" = "list";
+  private renameTargetPath: string | null = null;
+
+  // Focusable — propagate to sessionList or renameInput
   private _focused = false;
   get focused() { return this._focused; }
   set focused(v: boolean) {
     this._focused = v;
     this.sessionList.focused = v;
+    this.renameInput.focused = v;
+    if (v && this.mode === "rename") {
+      this.renameInput.focused = true;
+    }
+  }
+
+  private buildBaseLayout(content: Component, options?: { showHeader?: boolean }): void {
+    this.clear();
+    this.addChild(new Spacer(1));
+    this.addChild(new DynamicBorder((s) => this.theme.fg("accent", s)));
+    this.addChild(new Spacer(1));
+    if (options?.showHeader ?? true) {
+      this.addChild(this.header);
+      this.addChild(new Spacer(1));
+    }
+    this.addChild(content);
+    this.addChild(new Spacer(1));
+    this.addChild(new DynamicBorder((s) => this.theme.fg("accent", s)));
   }
 
   constructor(
@@ -362,7 +619,13 @@ class FastResumePicker extends Container {
     this.allMetas = allMetas;
 
     // Create header
-    this.header = new FastResumeHeader(theme);
+    this.header = new FastResumeHeader(theme, tuiRequestRender);
+
+    // Create rename input
+    this.renameInput = new Input();
+    this.renameInput.onSubmit = (value) => {
+      void this.confirmRename(value);
+    };
 
     // Create session list
     this.sessionList = new FastResumeSessionList(theme, currentSessionPath);
@@ -372,19 +635,65 @@ class FastResumePicker extends Container {
     // Set initial data into the list
     this.sessionList.setSessions(initialCurrentSessions, false);
 
-    // Wire events
+    // Wire session list events
     this.sessionList.onSelect = (sessionPath) => {
+      this.header.clearStatusTimeout();
       this.loadingAbort?.abort();
       this.done({ sessionPath, cancelled: false });
     };
     this.sessionList.onCancel = () => {
+      this.header.clearStatusTimeout();
       this.loadingAbort?.abort();
       this.done({ cancelled: true });
     };
     this.sessionList.onToggleScope = () => this.toggleScope();
+    this.sessionList.onToggleSort = () => this.toggleSortMode();
+    this.sessionList.onToggleNameFilter = () => this.toggleNameFilter();
+    this.sessionList.onTogglePath = (showPath) => {
+      this.header.showPath = showPath;
+      this.tuiRequestRender();
+    };
+    this.sessionList.onDeleteConfirmationChange = (path) => {
+      this.header.confirmingDeletePath = path;
+      this.tuiRequestRender();
+    };
+    this.sessionList.onError = (msg) => {
+      this.header.setStatusMessage({ type: "error", message: msg }, 3000);
+      this.tuiRequestRender();
+    };
+    this.sessionList.onDeleteSession = async (sessionPath) => {
+      const result = await deleteSessionFile(sessionPath);
+      if (result.ok) {
+        // Remove from both caches
+        if (this.currentSessions) {
+          this.currentSessions = this.currentSessions.filter((s) => s.path !== sessionPath);
+        }
+        if (this.allSessions) {
+          this.allSessions = this.allSessions.filter((s) => s.path !== sessionPath);
+        }
+        const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
+        const showCwd = this.scope === "all";
+        this.sessionList.setSessions(sessions, showCwd);
+        const msg = result.method === "trash" ? "Session moved to trash" : "Session deleted";
+        this.header.setStatusMessage({ type: "info", message: msg }, 2000);
+        // Refresh sessions in background since the file is gone
+        await this.refreshSessionsAfterMutation();
+      } else {
+        const errorMessage = result.error ?? "Unknown error";
+        this.header.setStatusMessage({ type: "error", message: `Failed to delete: ${errorMessage}` }, 3000);
+      }
+      this.tuiRequestRender();
+    };
+    this.sessionList.onRenameSession = (sessionPath) => {
+      if (this.scope === "current" && this.currentLoading) return;
+      if (this.scope === "all" && this.allLoading) return;
+      const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
+      const session = sessions.find((s) => s.path === sessionPath);
+      this.enterRenameMode(sessionPath, session?.name);
+    };
 
     // Build layout
-    this.buildLayout();
+    this.buildBaseLayout(this.sessionList);
 
     // Start loading current sessions (mark as loaded since we already have them)
     this.currentLoading = false;
@@ -396,16 +705,58 @@ class FastResumePicker extends Container {
     }
   }
 
-  private buildLayout(): void {
-    this.clear();
-    this.addChild(new Spacer(1));
-    this.addChild(new DynamicBorder((s) => this.theme.fg("accent", s)));
-    this.addChild(new Spacer(1));
-    this.addChild(this.header);
-    this.addChild(new Spacer(1));
-    this.addChild(this.sessionList);
-    this.addChild(new Spacer(1));
-    this.addChild(new DynamicBorder((s) => this.theme.fg("accent", s)));
+  private enterRenameMode(sessionPath: string, currentName?: string): void {
+    this.mode = "rename";
+    this.renameTargetPath = sessionPath;
+    this.renameInput.setValue(currentName ?? "");
+    this.renameInput.focused = true;
+
+    const panel = new Container();
+    panel.addChild(new Text(this.theme.bold("Rename Session"), 1, 0));
+    panel.addChild(new Spacer(1));
+    panel.addChild(this.renameInput);
+    panel.addChild(new Spacer(1));
+    panel.addChild(new Text(
+      this.theme.fg("muted", `${keyText("tui.select.confirm")} to save · ${keyText("tui.select.cancel")} to cancel`),
+      1,
+      0,
+    ));
+
+    this.buildBaseLayout(panel, { showHeader: false });
+    this.tuiRequestRender();
+  }
+
+  private exitRenameMode(): void {
+    this.mode = "list";
+    this.renameTargetPath = null;
+    this.buildBaseLayout(this.sessionList);
+    this.tuiRequestRender();
+  }
+
+  private async confirmRename(value: string): Promise<void> {
+    const next = value.trim();
+    if (!next) return;
+    const target = this.renameTargetPath;
+    if (!target) {
+      this.exitRenameMode();
+      return;
+    }
+
+    try {
+      const mgr = SessionManager.open(target);
+      mgr.appendSessionInfo(next);
+      await this.refreshSessionsAfterMutation();
+    } finally {
+      this.exitRenameMode();
+    }
+  }
+
+  private async refreshSessionsAfterMutation(): Promise<void> {
+    // After delete/rename, the in-memory arrays are already updated (filtered above).
+    // Just re-apply them to the session list.
+    const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
+    const showCwd = this.scope === "all";
+    this.sessionList.setSessions(sessions, showCwd);
   }
 
   private startAllLoadBackground(): void {
@@ -479,7 +830,30 @@ class FastResumePicker extends Container {
     this.tuiRequestRender();
   }
 
+  private toggleSortMode(): void {
+    this.sortMode = this.sortMode === "threaded" ? "recent" : this.sortMode === "recent" ? "fuzzy" : "threaded";
+    this.header.sortMode = this.sortMode;
+    this.sessionList.setSortMode(this.sortMode);
+    this.tuiRequestRender();
+  }
+
+  private toggleNameFilter(): void {
+    this.nameFilter = this.nameFilter === "all" ? "named" : "all";
+    this.header.nameFilter = this.nameFilter;
+    this.sessionList.setNameFilter(this.nameFilter);
+    this.tuiRequestRender();
+  }
+
   handleInput(data: string): void {
+    if (this.mode === "rename") {
+      const kb = getKeybindings();
+      if (kb.matches(data, "tui.select.cancel")) {
+        this.exitRenameMode();
+        return;
+      }
+      this.renameInput.handleInput(data);
+      return;
+    }
     this.sessionList.handleInput(data);
   }
 }

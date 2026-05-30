@@ -21,9 +21,9 @@ Same result — the exact same session picker UI you know from `/resume`. The di
 ```
 ──────────────────────────────────────────────────────────
 
-Resume Session (Current Folder)       ◉ Current Folder | ○ All
+Resume Session (Current Folder)       ◉ Current Folder | ○ All  Name: All  Sort: Threaded
 Tab scope · re:<pattern> regex · "phrase" exact
-Enter select · Esc cancel
+Ctrl+S sort · Ctrl+N named · Ctrl+D delete · Ctrl+P path (off) · Ctrl+R rename
 
 search: fix auth bug_
 
@@ -107,13 +107,20 @@ Reload with `/reload` after any install method.
 
 ### Picker controls
 
-| Key       | Action                                        |
-| --------- | --------------------------------------------- |
-| `↑` / `↓` | Navigate sessions                             |
-| `Enter`   | Switch to selected session                    |
-| `Esc`     | Cancel                                        |
-| `Tab`     | Toggle scope — current project ↔ all sessions |
-| type      | Filter sessions by text                       |
+Identical to built-in `/resume`:
+
+| Key          | Action                                        |
+| ------------ | --------------------------------------------- |
+| `↑` / `↓`   | Navigate sessions                             |
+| `Enter`      | Switch to selected session                    |
+| `Esc`        | Cancel                                        |
+| `Tab`        | Toggle scope — current project ↔ all sessions |
+| `Ctrl+S`     | Toggle sort — Threaded / Recent / Fuzzy       |
+| `Ctrl+N`     | Toggle name filter — All / Named              |
+| `Ctrl+P`     | Toggle session file path display              |
+| `Ctrl+D`     | Delete selected session (with confirmation)   |
+| `Ctrl+R`     | Rename selected session                       |
+| typing       | Filter sessions by text / regex / exact match |
 
 ### Scope
 
