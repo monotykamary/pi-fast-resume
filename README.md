@@ -175,7 +175,7 @@ However, pi-fast-resume can **prototype-patch** `InteractiveMode.showSessionSele
 
 - `/resume` opens the **fast** picker instead of the built-in one
 - `Ctrl+Shift+R` (or your mapped key) also opens the fast picker
-- `/fast-resume` still works as a hidden alias
+- `/fast-resume` is not registered (no duplicate command)
 - `pi -r` / `pi --resume` are **not** affected (they run before the interactive mode starts)
 
 ### Enable
