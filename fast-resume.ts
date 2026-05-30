@@ -15,7 +15,7 @@
  *   { "hijackResume": true }
  *
  *   When enabled, /resume and Ctrl+Shift+R open the fast picker instead.
- *   /fast-resume becomes a hidden alias. pi -r is not affected.
+ *   /fast-resume is not registered (no duplicate). pi -r is not affected.
  *
  * Keys in picker (identical to /resume):
  *   ↑/↓                   Navigate
@@ -983,14 +983,7 @@ export default function (pi: ExtensionAPI) {
   if (hijackResume) {
     // Hijack /resume — replace the built-in session selector with our fast picker
     installResumeHijack();
-
-    // Register /fast-resume as a hidden alias (still works, but not advertised)
-    pi.registerCommand("fast-resume", {
-      description: "(hidden) Fast session resume — /resume is already hijacked",
-      handler: async (_args, ctx) => {
-        await showFastResumePicker(ctx);
-      },
-    });
+    // Don't register /fast-resume — /resume already opens the fast picker
   } else {
     // Normal mode — register /fast-resume as a standalone command
     pi.registerCommand("fast-resume", {
