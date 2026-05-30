@@ -2,5 +2,3 @@ export { parseSessionFromBuffer, loadSessionHeader, loadSessionHeaders, scanAllS
 export type { SessionHeader, SessionFileMeta } from "./scanner.js";
 export { createInitialState, setScope, setSessions, setFilter, moveSelection } from "./picker-state.js";
 export type { PickerScope, PickerState } from "./picker-state.js";
-export { renderSessionList } from "./render.js";
-export type { RenderOptions } from "./render.js";

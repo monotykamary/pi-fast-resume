@@ -5,26 +5,33 @@
  * instead of parsing the entire JSONL. Shows results instantly with
  * incremental background loading.
  *
- * Usage:
- *   /fr [query]        Open fast session picker (current project scope)
- *   Ctrl+Shift+F       Open fast session picker via shortcut
+ * Mirrors the exact TUI layout and keybindings of pi's built-in /resume.
  *
- * Keys in picker:
- *   ↑/↓                Navigate
- *   Tab                Toggle scope (current project / all sessions)
- *   Enter              Select session
- *   Esc                Cancel
- *   typing             Filter sessions by fuzzy search
+ * Usage:
+ *   /fast-resume [query]   Open fast session picker (current project scope)
+ *   Ctrl+Shift+F           Open fast session picker via shortcut
+ *
+ * Keys in picker (identical to /resume):
+ *   ↑/↓                   Navigate
+ *   Tab                   Toggle scope (Current Folder / All)
+ *   Enter                 Select session
+ *   Esc                   Cancel
+ *   typing                Filter sessions by text search
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import { Theme, keyText } from "@earendil-works/pi-coding-agent";
+import { DynamicBorder, Theme, keyHint, keyText } from "@earendil-works/pi-coding-agent";
 import {
+  Container,
   type Component,
   fuzzyFilter,
   getKeybindings,
   Input,
   Key,
+  Spacer,
+  Text,
+  truncateToWidth,
+  visibleWidth,
 } from "@earendil-works/pi-tui";
 import { homedir } from "node:os";
 import {
@@ -37,10 +44,7 @@ import {
   type SessionHeader,
   type SessionFileMeta,
 } from "./src/scanner.js";
-import {
-  type PickerScope,
-} from "./src/picker-state.js";
-import { renderSessionList } from "./src/render.js";
+import type { PickerScope } from "./src/picker-state.js";
 
 const HOME = homedir();
 
@@ -49,32 +53,104 @@ export interface FastResumeResult {
   cancelled: boolean;
 }
 
-class FastResumePicker implements Component {
+// Helpers
+
+function shortenPath(path: string): string {
+  if (!path) return path;
+  if (path.startsWith(HOME)) {
+    return `~${path.slice(HOME.length)}`;
+  }
+  return path;
+}
+
+function formatSessionDate(date: Date): string {
+  const now = new Date();
+  const diffMs = now.getTime() - date.getTime();
+  const diffMins = Math.floor(diffMs / 60000);
+  const diffHours = Math.floor(diffMs / 3600000);
+  const diffDays = Math.floor(diffMs / 86400000);
+  if (diffMins < 1) return "now";
+  if (diffMins < 60) return `${diffMins}m`;
+  if (diffHours < 24) return `${diffHours}h`;
+  if (diffDays < 7) return `${diffDays}d`;
+  if (diffDays < 30) return `${Math.floor(diffDays / 7)}w`;
+  if (diffDays < 365) return `${Math.floor(diffDays / 30)}mo`;
+  return `${Math.floor(diffDays / 365)}y`;
+}
+
+// Header — mirrors SessionSelectorHeader layout exactly:
+// Line 1: Title (left) │ Scope indicators + loading progress (right)
+// Line 2: Hint line 1 (scope toggle + search hints)
+// Line 3: Hint line 2 (sort/delete/path — minimal for fast-resume)
+
+class FastResumeHeader implements Component {
   private theme: Theme;
-  private done: (result: FastResumeResult) => void;
-  private tuiRequestRender: () => void;
+  scope: PickerScope = "current";
+  loading = false;
+  loadProgress: { loaded: number; total: number } | null = null;
 
-  // Session data
-  private allMetas: SessionFileMeta[] = [];
-  private currentCwd: string;
-  private currentSessionPath: string | undefined;
-  private scope: PickerScope = "current";
+  constructor(theme: Theme) {
+    this.theme = theme;
+  }
 
-  // Parsed session state
-  private allSessions: SessionHeader[] = [];
-  private filteredSessions: SessionHeader[] = [];
-  private selectedIndex = 0;
+  invalidate(): void {}
 
-  // Search
-  private searchInput: Input;
+  render(width: number): string[] {
+    const t = this.theme;
 
-  // Loading state
-  private loadingAbort: AbortController | null = null;
-  private loadingDone = false;
-  private loadedCount = 0;
-  private totalCount = 0;
+    // Title (left side)
+    const title = this.scope === "current"
+      ? t.bold("Resume Session (Current Folder)")
+      : t.bold("Resume Session (All)");
 
-  // Focusable — propagate to searchInput for IME cursor positioning
+    // Scope indicators (right side)
+    let scopeText: string;
+    if (this.loading) {
+      const progressText = this.loadProgress
+        ? `${this.loadProgress.loaded}/${this.loadProgress.total}`
+        : "...";
+      scopeText = `${t.fg("muted", "○ Current Folder | ")}${t.fg("accent", `Loading ${progressText}`)}`;
+    } else if (this.scope === "current") {
+      scopeText = `${t.fg("accent", "◉ Current Folder")}${t.fg("muted", " | ○ All")}`;
+    } else {
+      scopeText = `${t.fg("muted", "○ Current Folder | ")}${t.fg("accent", "◉ All")}`;
+    }
+
+    const rightText = truncateToWidth(scopeText, width, "");
+    const availableLeft = Math.max(0, width - visibleWidth(rightText) - 1);
+    const left = truncateToWidth(title, availableLeft, "");
+    const spacing = Math.max(0, width - visibleWidth(left) - visibleWidth(rightText));
+
+    // Hint lines — same style as built-in selector
+    const sep = t.fg("muted", " · ");
+    const hint1 = keyHint("tui.input.tab", "scope") + sep + t.fg("muted", 're:<pattern> regex · "phrase" exact');
+    const hint2 = keyHint("tui.select.confirm", "select") + sep + keyHint("tui.select.cancel", "cancel");
+
+    return [
+      `${left}${" ".repeat(spacing)}${rightText}`,
+      truncateToWidth(hint1, width, "…"),
+      truncateToWidth(hint2, width, "…"),
+    ];
+  }
+}
+
+// Session list — mirrors SessionList rendering exactly:
+// search input + blank line + session rows (one line each, right-aligned metadata)
+
+class FastResumeSessionList implements Component {
+  private theme: Theme;
+  allSessions: SessionHeader[] = [];
+  filteredSessions: SessionHeader[] = [];
+  selectedIndex = 0;
+  searchInput: Input;
+  showCwd = false;
+  maxVisible = 10;
+  currentSessionPath: string | undefined;
+
+  onSelect?: (sessionPath: string) => void;
+  onCancel?: () => void;
+  onToggleScope?: () => void;
+
   private _focused = false;
   get focused() { return this._focused; }
   set focused(v: boolean) {
@@ -82,95 +158,35 @@ class FastResumePicker implements Component {
     this.searchInput.focused = v;
   }
 
-  constructor(
-    theme: Theme,
-    currentCwd: string,
-    currentSessionPath: string | undefined,
-    initialSessions: SessionHeader[],
-    allMetas: SessionFileMeta[],
-    totalCount: number,
-    loadingDone: boolean,
-    done: (result: FastResumeResult) => void,
-    tuiRequestRender: () => void,
-  ) {
+  constructor(theme: Theme, currentSessionPath: string | undefined) {
     this.theme = theme;
-    this.currentCwd = currentCwd;
     this.currentSessionPath = currentSessionPath;
-    this.done = done;
-    this.tuiRequestRender = tuiRequestRender;
-
-    this.allMetas = allMetas;
-    this.totalCount = totalCount;
-    this.loadingDone = loadingDone;
-    this.loadedCount = initialSessions.length;
-
-    this.allSessions = initialSessions;
-    this.filteredSessions = initialSessions;
-
     this.searchInput = new Input();
 
-    // Enter in search selects current item
     this.searchInput.onSubmit = () => {
-      this.selectCurrent();
-    };
-
-    // Start background loading if there are more sessions
-    if (!loadingDone && allMetas.length > 0) {
-      this.startBackgroundLoad(allMetas, initialSessions.length);
-    }
-  }
-
-  private startBackgroundLoad(
-    metas: SessionFileMeta[],
-    skipFirst: number,
-  ): void {
-    this.loadingAbort = new AbortController();
-    const signal = this.loadingAbort.signal;
-
-    const BATCH_SIZE = 50;
-    const sorted = sortByModifiedDesc([...metas]);
-    let offset = skipFirst;
-
-    const loadBatch = () => {
-      if (signal.aborted) return;
-
-      const batch = sorted.slice(offset, offset + BATCH_SIZE);
-      if (batch.length === 0) {
-        this.loadingDone = true;
-        this.tuiRequestRender();
-        return;
+      if (this.filteredSessions[this.selectedIndex]) {
+        this.onSelect?.(this.filteredSessions[this.selectedIndex]!.path);
       }
-
-      const headers = loadSessionHeaders(batch);
-      this.allSessions = sortByModified([...this.allSessions, ...headers]);
-      this.applyFilter();
-
-      this.loadedCount = this.allSessions.length;
-      this.tuiRequestRender();
-
-      offset += BATCH_SIZE;
-      setImmediate(loadBatch);
     };
-
-    setImmediate(loadBatch);
   }
 
-  private applyFilter(): void {
-    const query = this.searchInput.getValue().trim();
-    const pool = this.scope === "current"
-      ? filterByCwd(this.allSessions, this.currentCwd)
-      : this.allSessions;
+  setSessions(sessions: SessionHeader[], showCwd: boolean): void {
+    this.allSessions = sessions;
+    this.showCwd = showCwd;
+    this.filterSessions(this.searchInput.getValue());
+  }
 
-    if (query) {
+  filterSessions(query: string): void {
+    const trimmed = query.trim();
+    if (trimmed) {
       this.filteredSessions = fuzzyFilter(
-        pool,
-        query,
+        this.allSessions,
+        trimmed,
         (s) => `${s.name ?? ""} ${s.firstMessage} ${s.cwd} ${s.id}`,
       );
     } else {
-      this.filteredSessions = pool;
+      this.filteredSessions = [...this.allSessions];
     }
-
     this.selectedIndex = Math.min(
       this.selectedIndex,
       Math.max(0, this.filteredSessions.length - 1),
@@ -181,143 +197,290 @@ class FastResumePicker implements Component {
     this.searchInput.invalidate();
   }
 
+  render(width: number): string[] {
+    const t = this.theme;
+    const lines: string[] = [];
+
+    // Search input
+    lines.push(...this.searchInput.render(width));
+    lines.push(""); // Blank line after search
+
+    if (this.filteredSessions.length === 0) {
+      let emptyMessage: string;
+      if (this.showCwd) {
+        emptyMessage = "  No sessions found";
+      } else {
+        emptyMessage = "  No sessions in current folder. Press Tab to view all.";
+      }
+      lines.push(t.fg("muted", truncateToWidth(emptyMessage, width, "…")));
+      return lines;
+    }
+
+    // Calculate visible range with scrolling
+    const startIndex = Math.max(
+      0,
+      Math.min(
+        this.selectedIndex - Math.floor(this.maxVisible / 2),
+        this.filteredSessions.length - this.maxVisible,
+      ),
+    );
+    const endIndex = Math.min(startIndex + this.maxVisible, this.filteredSessions.length);
+
+    for (let i = startIndex; i < endIndex; i++) {
+      const session = this.filteredSessions[i]!;
+      const isSelected = i === this.selectedIndex;
+      const isCurrent = session.path === this.currentSessionPath;
+      const hasName = !!session.name;
+
+      // Session display text
+      const displayText = (session.name ?? session.firstMessage ?? "(empty)")
+        .replace(/[\x00-\x1f\x7f]/g, " ")
+        .trim();
+
+      // Right side: cwd (if all scope) + message count + age
+      const age = formatSessionDate(session.modified);
+      const msgCount = String(session.messageCount);
+      let rightPart = `${msgCount} ${age}`;
+      if (this.showCwd && session.cwd) {
+        rightPart = `${shortenPath(session.cwd)} ${rightPart}`;
+      }
+
+      // Cursor
+      const cursor = isSelected ? t.fg("accent", "› ") : "  ";
+
+      // Calculate available width for message
+      const rightWidth = visibleWidth(rightPart) + 2;
+      const availableForMsg = width - 2 - rightWidth; // -2 for cursor
+      const truncatedMsg = truncateToWidth(displayText, Math.max(10, availableForMsg), "…");
+
+      // Style message — same color logic as built-in
+      let messageColor: Parameters<Theme["fg"]>[0] | null = null;
+      if (isCurrent) {
+        messageColor = "accent";
+      } else if (hasName) {
+        messageColor = "warning";
+      }
+      let styledMsg = messageColor ? t.fg(messageColor, truncatedMsg) : truncatedMsg;
+      if (isSelected) {
+        styledMsg = t.bold(styledMsg);
+      }
+
+      // Build line — same layout as built-in
+      const leftPart = cursor + styledMsg;
+      const leftWidth = visibleWidth(leftPart);
+      const spacing = Math.max(1, width - leftWidth - visibleWidth(rightPart));
+      const styledRight = t.fg("dim", rightPart);
+      let line = leftPart + " ".repeat(spacing) + styledRight;
+      if (isSelected) {
+        line = t.bg("selectedBg", line);
+      }
+      lines.push(truncateToWidth(line, width));
+    }
+
+    // Scroll indicator
+    if (startIndex > 0 || endIndex < this.filteredSessions.length) {
+      const scrollText = `  (${this.selectedIndex + 1}/${this.filteredSessions.length})`;
+      lines.push(t.fg("muted", truncateToWidth(scrollText, width, "")));
+    }
+
+    return lines;
+  }
+
   handleInput(data: string): void {
     const kb = getKeybindings();
 
-    if (kb.matches(data, "tui.select.cancel")) {
-      this.loadingAbort?.abort();
-      this.done({ cancelled: true });
-      return;
-    }
-
-    if (kb.matches(data, "tui.select.confirm")) {
-      this.selectCurrent();
+    if (kb.matches(data, "tui.input.tab")) {
+      this.onToggleScope?.();
       return;
     }
 
     if (kb.matches(data, "tui.select.up")) {
       this.selectedIndex = Math.max(0, this.selectedIndex - 1);
-      this.tuiRequestRender();
-      return;
-    }
-
-    if (kb.matches(data, "tui.select.down")) {
+    } else if (kb.matches(data, "tui.select.down")) {
       this.selectedIndex = Math.min(this.filteredSessions.length - 1, this.selectedIndex + 1);
-      this.tuiRequestRender();
-      return;
+    } else if (kb.matches(data, "tui.select.pageUp")) {
+      this.selectedIndex = Math.max(0, this.selectedIndex - this.maxVisible);
+    } else if (kb.matches(data, "tui.select.pageDown")) {
+      this.selectedIndex = Math.min(this.filteredSessions.length - 1, this.selectedIndex + this.maxVisible);
+    } else if (kb.matches(data, "tui.select.confirm")) {
+      const selected = this.filteredSessions[this.selectedIndex];
+      if (selected && this.onSelect) {
+        this.onSelect(selected.path);
+      }
+    } else if (kb.matches(data, "tui.select.cancel")) {
+      this.onCancel?.();
+    } else {
+      // Pass everything else to search input
+      this.searchInput.handleInput(data);
+      this.filterSessions(this.searchInput.getValue());
     }
+  }
+}
 
-    if (kb.matches(data, "tui.select.pageUp")) {
-      this.selectedIndex = Math.max(0, this.selectedIndex - 10);
-      this.tuiRequestRender();
-      return;
-    }
+// Top-level component — mirrors SessionSelectorComponent layout exactly:
+// Spacer(1) → DynamicBorder → Spacer(1) → Header → Spacer(1) → SessionList → Spacer(1) → DynamicBorder
 
-    if (kb.matches(data, "tui.select.pageDown")) {
-      this.selectedIndex = Math.min(this.filteredSessions.length - 1, this.selectedIndex + 10);
-      this.tuiRequestRender();
-      return;
-    }
+class FastResumePicker extends Container {
+  private header: FastResumeHeader;
+  private sessionList: FastResumeSessionList;
+  private theme: Theme;
+  private tuiRequestRender: () => void;
+  private done: (result: FastResumeResult) => void;
 
-    if (kb.matches(data, "tui.input.tab")) {
-      this.toggleScope();
-      return;
-    }
+  private scope: PickerScope = "current";
+  private currentSessions: SessionHeader[] | null = null;
+  private allSessions: SessionHeader[] | null = null;
+  private currentLoading = false;
+  private allLoading = false;
 
-    // Forward everything else to search input
-    this.searchInput.handleInput(data);
-    this.applyFilter();
-    this.tuiRequestRender();
+  private allMetas: SessionFileMeta[] = [];
+  private loadingAbort: AbortController | null = null;
+  private allLoadSeq = 0;
+
+  // Focusable — propagate to sessionList
+  private _focused = false;
+  get focused() { return this._focused; }
+  set focused(v: boolean) {
+    this._focused = v;
+    this.sessionList.focused = v;
   }
 
-  private selectCurrent(): void {
-    this.loadingAbort?.abort();
-    const selected = this.filteredSessions[this.selectedIndex];
-    this.done({
-      sessionPath: selected?.path,
-      cancelled: false,
-    });
+  constructor(
+    theme: Theme,
+    currentCwd: string,
+    currentSessionPath: string | undefined,
+    initialCurrentSessions: SessionHeader[],
+    allMetas: SessionFileMeta[],
+    allSessions: SessionHeader[] | null,
+    done: (result: FastResumeResult) => void,
+    tuiRequestRender: () => void,
+  ) {
+    super();
+    this.theme = theme;
+    this.done = done;
+    this.tuiRequestRender = tuiRequestRender;
+    this.allMetas = allMetas;
+
+    // Create header
+    this.header = new FastResumeHeader(theme);
+
+    // Create session list
+    this.sessionList = new FastResumeSessionList(theme, currentSessionPath);
+    this.currentSessions = initialCurrentSessions;
+    this.allSessions = allSessions;
+
+    // Set initial data into the list
+    this.sessionList.setSessions(initialCurrentSessions, false);
+
+    // Wire events
+    this.sessionList.onSelect = (sessionPath) => {
+      this.loadingAbort?.abort();
+      this.done({ sessionPath, cancelled: false });
+    };
+    this.sessionList.onCancel = () => {
+      this.loadingAbort?.abort();
+      this.done({ cancelled: true });
+    };
+    this.sessionList.onToggleScope = () => this.toggleScope();
+
+    // Build layout
+    this.buildLayout();
+
+    // Start loading current sessions (mark as loaded since we already have them)
+    this.currentLoading = false;
+    this.header.loading = false;
+
+    // If we don't have all sessions yet, pre-load them in the background
+    if (allSessions === null && allMetas.length > 0) {
+      this.startAllLoadBackground();
+    }
+  }
+
+  private buildLayout(): void {
+    this.clear();
+    this.addChild(new Spacer(1));
+    this.addChild(new DynamicBorder((s) => this.theme.fg("accent", s)));
+    this.addChild(new Spacer(1));
+    this.addChild(this.header);
+    this.addChild(new Spacer(1));
+    this.addChild(this.sessionList);
+    this.addChild(new Spacer(1));
+    this.addChild(new DynamicBorder((s) => this.theme.fg("accent", s)));
+  }
+
+  private startAllLoadBackground(): void {
+    this.allLoading = true;
+    const seq = ++this.allLoadSeq;
+    const BATCH_SIZE = 50;
+    const sorted = sortByModifiedDesc([...this.allMetas]);
+    let offset = 0;
+    const allParsed: SessionHeader[] = [];
+
+    const loadBatch = () => {
+      if (seq !== this.allLoadSeq) return; // Stale
+      if (this.loadingAbort?.signal.aborted) return;
+
+      const batch = sorted.slice(offset, offset + BATCH_SIZE);
+      if (batch.length === 0) {
+        this.allLoading = false;
+        this.allSessions = sortByModified(allParsed);
+
+        // If we're currently showing "all" scope, update the list
+        if (this.scope === "all") {
+          this.header.loading = false;
+          this.sessionList.setSessions(this.allSessions, true);
+          this.tuiRequestRender();
+        }
+        return;
+      }
+
+      const headers = loadSessionHeaders(batch);
+      allParsed.push(...headers);
+
+      // If we're currently showing "all" scope, update progress
+      if (this.scope === "all") {
+        this.header.loadProgress = { loaded: allParsed.length, total: sorted.length };
+        this.allSessions = sortByModified([...allParsed]);
+        this.sessionList.setSessions(this.allSessions, true);
+        this.tuiRequestRender();
+      }
+
+      offset += BATCH_SIZE;
+      setImmediate(loadBatch);
+    };
+
+    setImmediate(loadBatch);
   }
 
   private toggleScope(): void {
-    this.loadingAbort?.abort();
-    const newScope: PickerScope = this.scope === "current" ? "all" : "current";
-    this.scope = newScope;
+    if (this.scope === "current") {
+      this.scope = "all";
+      this.header.scope = "all";
 
-    if (newScope === "current") {
-      this.applyFilter();
-      this.loadingDone = true;
-    } else {
-      this.applyFilter();
-      if (!this.loadingDone && this.allMetas.length > 0) {
-        this.startBackgroundLoad(this.allMetas, this.loadedCount);
+      if (this.allSessions !== null) {
+        this.header.loading = false;
+        this.sessionList.setSessions(this.allSessions, true);
+      } else if (!this.allLoading) {
+        // Start loading all sessions
+        this.allLoading = true;
+        this.header.loading = true;
+        this.header.loadProgress = null;
+        this.startAllLoadBackground();
+      } else {
+        this.header.loading = true;
       }
+    } else {
+      this.scope = "current";
+      this.header.scope = "current";
+      this.header.loading = false;
+      this.sessionList.setSessions(this.currentSessions ?? [], false);
     }
 
     this.tuiRequestRender();
   }
 
-  render(width: number): string[] {
-    const lines: string[] = [];
-    const borderChar = "─".repeat(width);
-    const border = this.theme.fg("borderAccent", borderChar);
-
-    // Top border
-    lines.push(border);
-    lines.push("");
-
-    // Title line — Fast Resume │ scope │ status
-    const title = this.theme.fg("accent", this.theme.bold("Fast Resume"));
-    const scopeLabel = this.scope === "current" ? "Current project" : "All sessions";
-    const statusText = this.loadingDone
-      ? `${this.filteredSessions.length} session${this.filteredSessions.length !== 1 ? "s" : ""}`
-      : `Loading ${this.loadedCount}/${this.totalCount}…`;
-
-    lines.push(
-      title
-        + "  " + this.theme.fg("dim", "│")
-        + "  " + this.theme.fg("muted", scopeLabel)
-        + "  " + this.theme.fg("dim", "│")
-        + "  " + this.theme.fg("muted", statusText),
-    );
-    lines.push("");
-
-    // Search input
-    lines.push(...this.searchInput.render(width));
-    lines.push("");
-
-    // Session list
-    lines.push(...renderSessionList(
-      this.filteredSessions,
-      this.selectedIndex,
-      this.theme,
-      {
-        scope: this.scope,
-        loadedCount: this.loadedCount,
-        totalCount: this.totalCount,
-        loadingDone: this.loadingDone,
-        filterQuery: this.searchInput.getValue(),
-        showCwd: this.scope === "all",
-        currentSessionPath: this.currentSessionPath,
-      },
-      width,
-    ));
-
-    lines.push("");
-
-    // Bottom border
-    lines.push(border);
-
-    // Footer key hints
-    const footerParts = [
-      `${keyText("tui.select.up")} ${keyText("tui.select.down")} navigate`,
-      `${keyText("tui.select.confirm")} select`,
-      `${keyText("tui.select.cancel")} cancel`,
-      `Tab ${this.scope === "current" ? "all" : "project"}`,
-    ];
-    lines.push(this.theme.fg("dim", "  " + footerParts.join(" · ")));
-
-    return lines;
+  handleInput(data: string): void {
+    this.sessionList.handleInput(data);
   }
 }
 
@@ -331,8 +494,6 @@ async function showFastResumePicker(
   const t0 = Date.now();
 
   // Phase 1: stat all session files
-  // "current" scope reads from the cwd-specific session dir
-  // "all" scope reads from ALL session directories (like pi's listAll)
   const currentMetas = sessionDir ? scanSessionDir(sessionDir) : [];
   const allMetas = scanAllSessionDirs();
 
@@ -341,12 +502,12 @@ async function showFastResumePicker(
   const sortedCurrent = sortByModifiedDesc(currentMetas);
   const quickMetas = sortedCurrent.slice(0, INITIAL_BATCH);
   const quickHeaders = loadSessionHeaders(quickMetas);
-  const initialSessions = sortByModified(quickHeaders);
+  const currentSessions = sortByModified(quickHeaders);
 
   const loadTime = Date.now() - t0;
 
   ctx.ui.notify(
-    `Fast resume: ${initialSessions.length} current, ${allMetas.length} total in ${loadTime}ms`,
+    `Fast resume: ${currentSessions.length} current, ${allMetas.length} total in ${loadTime}ms`,
     "info",
   );
 
@@ -356,10 +517,9 @@ async function showFastResumePicker(
         theme,
         cwd,
         ctx.sessionManager.getSessionFile(),
-        initialSessions,
+        currentSessions,
         allMetas,
-        allMetas.length,
-        quickMetas.length >= sortedCurrent.length,
+        null, // allSessions not yet loaded — will load in background
         (result) => done(result),
         () => _tui.requestRender(),
       );
@@ -374,7 +534,7 @@ async function showFastResumePicker(
 }
 
 export default function (pi: ExtensionAPI) {
-  pi.registerCommand("fr", {
+  pi.registerCommand("fast-resume", {
     description: "Fast session resume — instant picker with incremental loading",
     getArgumentCompletions: (prefix: string) => {
       if (!prefix) return null;

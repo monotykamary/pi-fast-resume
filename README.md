@@ -14,22 +14,25 @@ _Reads 16KB per file instead of the full JSONL — first results in **6ms**._
 ---
 
 > **`/resume` takes 5.6 seconds** when you have 1,700+ sessions.
-> pi-fast-resume's `/fr` takes **6 milliseconds**.
+> pi-fast-resume's `/fast-resume` takes **6 milliseconds**.
 
-Same result — a session picker you can browse and search. The difference is pi-fast-resume never reads beyond the first 16KB of any session file. Headers, names, first messages — they all live in the first few lines. Everything after that is full message history the picker never shows.
+Same result — the exact same session picker UI you know from `/resume`. The difference is pi-fast-resume never reads beyond the first 16KB of any session file. Headers, names, first messages — they all live in the first few lines. Everything after that is full message history the picker never shows.
 
 ```
- ┌──────────────────────────────────────────────────────┐
- │ fast-resume │ Current project │ Tab toggle │ 42 sess │
- │ filter: fix auth bug_                                │
- │──────────────────────────────────────────────────────│
- │ ❯ "Fix the auth bypass in middleware" ─ 2m ago · 34  │
- │   "Add rate limiting to API" ─ 5h ago · 98           │
- │   "Refactor user service" ─ 1d ago · 156             │
- │   Auth refactor ─ 3d ago · 67                        │
- │──────────────────────────────────────────────────────│
- │ ↑↓ navigate · Enter select · Esc cancel · Tab scope  │
- └──────────────────────────────────────────────────────┘
+──────────────────────────────────────────────────────────
+
+Resume Session (Current Folder)       ◉ Current Folder | ○ All
+Tab scope · re:<pattern> regex · "phrase" exact
+Enter select · Esc cancel
+
+search: fix auth bug_
+
+› Fix the auth bypass in middleware                    34 2m
+  Add rate limiting to API                             98 5h
+  Refactor user service                              156 1d
+  Auth refactor                                       67 3d
+
+──────────────────────────────────────────────────────────
 ```
 
 ## Benchmarks
@@ -89,11 +92,11 @@ Reload with `/reload` after any install method.
 
 ## Usage
 
-### `/fr` command
+### `/fast-resume` command
 
 ```
-/fr              Open picker (current project)
-/fr auth bug     Open picker pre-filtered to "auth bug"
+/fast-resume              Open picker (current project)
+/fast-resume auth bug     Open picker pre-filtered to "auth bug"
 ```
 
 ### Keyboard shortcut
@@ -157,11 +160,11 @@ An indexed approach would be faster for subsequent queries, but at the cost of r
 
 6 ms is fast enough. The data is always fresh because it's read from disk every time. No staleness bugs, no index corruption, no extra files in `~/.pi/`.
 
-## Why `/fr` and not `/resume`?
+## Why `/fast-resume` and not `/resume`?
 
 pi's built-in `/resume` is handled inside the interactive mode's `onSubmit` callback — it returns early before extension commands or input events are ever checked. Extensions **cannot intercept built-in commands**. This is the same for `/new`, `/model`, `/settings`, etc.
 
-`/fr` and `Ctrl+Shift+F` are the practical alternatives. The shortcut is arguably better UX — instant access from any state, no typing.
+`/fast-resume` and `Ctrl+Shift+F` are the practical alternatives. The shortcut is arguably better UX — instant access from any state, no typing.
 
 ## Similar extensions
 
