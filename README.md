@@ -167,11 +167,32 @@ An indexed approach would be faster for subsequent queries, but at the cost of r
 
 6 ms is fast enough. The data is always fresh because it's read from disk every time. No staleness bugs, no index corruption, no extra files in `~/.pi/`.
 
-## Why `/fast-resume` and not `/resume`?
+## Hijack mode
 
-pi's built-in `/resume` is handled inside the interactive mode's `onSubmit` callback — it returns early before extension commands or input events are ever checked. Extensions **cannot intercept built-in commands**. This is the same for `/new`, `/model`, `/settings`, etc.
+pi's built-in `/resume` is handled inside the interactive mode's `onSubmit` callback — it returns early before extension commands or input events are ever checked. Extensions **cannot intercept built-in commands** directly.
 
-`/fast-resume` and `Ctrl+Shift+F` are the practical alternatives. The shortcut is arguably better UX — instant access from any state, no typing.
+However, pi-fast-resume can **prototype-patch** `InteractiveMode.showSessionSelector` to intercept both the `/resume` command and the `app.session.resume` keybinding. When hijack mode is active:
+
+- `/resume` opens the **fast** picker instead of the built-in one
+- `Ctrl+Shift+R` (or your mapped key) also opens the fast picker
+- `/fast-resume` still works as a hidden alias
+- `pi -r` / `pi --resume` are **not** affected (they run before the interactive mode starts)
+
+### Enable
+
+Create or edit `~/.pi/agent/extensions/pi-fast-resume.json`:
+
+```json
+{
+  "hijackResume": true
+}
+```
+
+Then reload with `/reload`. To disable, set `hijackResume` to `false` (or delete the key) and reload.
+
+### How it works
+
+On load, the extension patches `InteractiveMode.prototype.showSessionSelector` to open the fast picker via `ctx.ui.custom()`. On `session_shutdown` (reload, quit, session switch), the prototype is restored. The patch guards against API changes — if `showSessionSelector` doesn't exist or the runtime can't produce an `ExtensionCommandContext`, it falls back to the original.
 
 ## Similar extensions
 

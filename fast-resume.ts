@@ -11,6 +11,12 @@
  *   /fast-resume [query]   Open fast session picker (current project scope)
  *   Ctrl+Shift+F           Open fast session picker via shortcut
  *
+ * Hijack mode (opt-in via ~/.pi/agent/extensions/pi-fast-resume.json):
+ *   { "hijackResume": true }
+ *
+ *   When enabled, /resume and Ctrl+Shift+R open the fast picker instead.
+ *   /fast-resume becomes a hidden alias. pi -r is not affected.
+ *
  * Keys in picker (identical to /resume):
  *   ↑/↓                   Navigate
  *   Tab                   Toggle scope (Current Folder / All)
@@ -27,6 +33,7 @@
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import {
   DynamicBorder,
+  InteractiveMode,
   keyHint,
   keyText,
   SessionManager,
@@ -44,9 +51,10 @@ import {
   truncateToWidth,
   visibleWidth,
 } from "@earendil-works/pi-tui";
-import { existsSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { unlink } from "node:fs/promises";
 import { homedir } from "node:os";
+import { join } from "node:path";
 import { spawnSync } from "node:child_process";
 import {
   scanAllSessionDirs,
@@ -61,6 +69,24 @@ import {
 import type { PickerScope } from "./src/picker-state.js";
 
 const HOME = homedir();
+
+// Config — read from ~/.pi/agent/extensions/pi-fast-resume.json
+// Example: { "hijackResume": true }
+interface FastResumeConfig {
+  hijackResume?: boolean;
+}
+
+const CONFIG_PATH = join(HOME, ".pi", "agent", "extensions", "pi-fast-resume.json");
+
+function readConfig(): FastResumeConfig {
+  try {
+    if (!existsSync(CONFIG_PATH)) return {};
+    const raw = readFileSync(CONFIG_PATH, "utf-8");
+    return JSON.parse(raw) as FastResumeConfig;
+  } catch {
+    return {};
+  }
+}
 
 export interface FastResumeResult {
   sessionPath?: string;
@@ -907,23 +933,90 @@ async function showFastResumePicker(
   }
 }
 
+// Reference to the original showSessionSelector, saved before patching
+let origShowSessionSelector: ((this: InteractiveMode) => void) | null = null;
+
+function installResumeHijack(): void {
+  if (origShowSessionSelector !== null) return; // Already patched
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- prototype patching requires any cast for private access
+  const proto = InteractiveMode.prototype as any;
+  if (
+    !InteractiveMode ||
+    typeof InteractiveMode !== "function" ||
+    typeof proto.showSessionSelector !== "function"
+  ) {
+    return; // Guard: API changed or not available
+  }
+  origShowSessionSelector = proto.showSessionSelector;
+  proto.showSessionSelector = function (this: InteractiveMode) {
+    // Try to get an ExtensionCommandContext from the running session's extension runner
+    const session = (this as any).session;
+    if (!session?.extensionRunner?.createCommandContext) {
+      // Fallback to original if we can't get a command context
+      origShowSessionSelector!.call(this);
+      return;
+    }
+    const ctx = session.extensionRunner.createCommandContext() as ExtensionCommandContext;
+    // Fire-and-forget — same pattern as the original (synchronous, UI appears immediately)
+    void showFastResumePicker(ctx);
+  };
+}
+
+function uninstallResumeHijack(): void {
+  if (origShowSessionSelector === null) return;
+  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- prototype patching requires any cast for private access
+  const proto = InteractiveMode.prototype as any;
+  if (
+    InteractiveMode &&
+    typeof InteractiveMode === "function" &&
+    typeof proto.showSessionSelector === "function"
+  ) {
+    proto.showSessionSelector = origShowSessionSelector;
+  }
+  origShowSessionSelector = null;
+}
+
 export default function (pi: ExtensionAPI) {
-  pi.registerCommand("fast-resume", {
-    description: "Fast session resume — instant picker with incremental loading",
-    getArgumentCompletions: (prefix: string) => {
-      if (!prefix) return null;
-      return [{ value: prefix, label: `Search: ${prefix}` }];
-    },
-    handler: async (args, ctx) => {
-      const query = args?.trim() || undefined;
-      await showFastResumePicker(ctx, query);
-    },
-  });
+  const config = readConfig();
+  const hijackResume = config.hijackResume === true;
+
+  if (hijackResume) {
+    // Hijack /resume — replace the built-in session selector with our fast picker
+    installResumeHijack();
+
+    // Register /fast-resume as a hidden alias (still works, but not advertised)
+    pi.registerCommand("fast-resume", {
+      description: "(hidden) Fast session resume — /resume is already hijacked",
+      handler: async (_args, ctx) => {
+        await showFastResumePicker(ctx);
+      },
+    });
+  } else {
+    // Normal mode — register /fast-resume as a standalone command
+    pi.registerCommand("fast-resume", {
+      description: "Fast session resume — instant picker with incremental loading",
+      getArgumentCompletions: (prefix: string) => {
+        if (!prefix) return null;
+        return [{ value: prefix, label: `Search: ${prefix}` }];
+      },
+      handler: async (args, ctx) => {
+        const query = args?.trim() || undefined;
+        await showFastResumePicker(ctx, query);
+      },
+    });
+  }
 
   pi.registerShortcut(Key.ctrlShift("f"), {
-    description: "Open fast session resume picker",
+    description: hijackResume ? "Open fast session resume (also /resume)" : "Open fast session resume picker",
     handler: async (ctx) => {
       await showFastResumePicker(ctx as unknown as ExtensionCommandContext);
     },
+  });
+
+  // Clean up the prototype patch on session shutdown (reload, quit, session switch)
+  pi.on("session_shutdown", () => {
+    if (hijackResume) {
+      uninstallResumeHijack();
+    }
   });
 }
