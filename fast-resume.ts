@@ -28,6 +28,16 @@
  *   Enter                 Select session
  *   Esc                   Cancel
  *   typing                Filter sessions by text search
+ *
+ * Search modes (identical to /resume):
+ *   fuzzy words            foo bar          fuzzy-match each token
+ *   exact phrase           "node cve"       case-insensitive substring
+ *   regex                  re:<pattern>      RegExp search (case-insensitive)
+ *
+ * Note on search depth: pi-fast-resume only reads the first 16KB of each
+ * session file, so search matches against id + name + firstMessage + cwd.
+ * Upstream /resume matches against all messages (allMessagesText). This
+ * tradeoff is by design — the 6ms load time depends on partial reads.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
@@ -42,7 +52,6 @@ import {
 import {
   Container,
   type Component,
-  fuzzyFilter,
   getKeybindings,
   Input,
   Key,
@@ -62,10 +71,22 @@ import {
   loadSessionHeaders,
   sortByModified,
   sortByModifiedDesc,
-  filterByCwd,
+  canonicalizePath,
   type SessionHeader,
   type SessionFileMeta,
 } from "./src/scanner.js";
+import {
+  parseSearchQuery,
+  matchSession,
+  hasSessionName,
+  filterAndSortSessions,
+  buildSessionTree,
+  flattenSessionTree,
+  buildTreePrefix,
+  type FlatSessionNode,
+  type SortMode,
+  type NameFilter,
+} from "./src/search.js";
 import type { PickerScope } from "./src/picker-state.js";
 
 const HOME = homedir();
@@ -93,8 +114,6 @@ export interface FastResumeResult {
   cancelled: boolean;
 }
 
-type SortMode = "threaded" | "recent" | "fuzzy";
-type NameFilter = "all" | "named";
 type StatusMessage = { type: "info" | "error"; message: string };
 
 // Helpers
@@ -120,10 +139,6 @@ function formatSessionDate(date: Date): string {
   if (diffDays < 30) return `${Math.floor(diffDays / 7)}w`;
   if (diffDays < 365) return `${Math.floor(diffDays / 30)}mo`;
   return `${Math.floor(diffDays / 365)}y`;
-}
-
-function hasSessionName(session: SessionHeader): boolean {
-  return Boolean(session.name?.trim());
 }
 
 async function deleteSessionFile(sessionPath: string): Promise<{ ok: boolean; method?: string; error?: string }> {
@@ -272,13 +287,14 @@ class FastResumeHeader implements Component {
   }
 }
 
-// Session list — mirrors SessionList rendering exactly:
+// Session list — mirrors upstream SessionList rendering exactly:
 // search input + blank line + session rows (one line each, right-aligned metadata)
+// Supports tree structure in threaded mode (├─ └─ │ prefixes)
 
 class FastResumeSessionList implements Component {
   private theme: Theme;
   allSessions: SessionHeader[] = [];
-  filteredSessions: SessionHeader[] = [];
+  filteredNodes: FlatSessionNode[] = [];
   selectedIndex = 0;
   searchInput: Input;
   showCwd = false;
@@ -287,10 +303,11 @@ class FastResumeSessionList implements Component {
   nameFilter: NameFilter = "all";
   confirmingDeletePath: string | null = null;
   maxVisible = 10;
-  currentSessionPath: string | undefined;
+  currentSessionCanonicalPath: string | undefined;
 
   onSelect?: (sessionPath: string) => void;
   onCancel?: () => void;
+  onExit?: () => void;
   onToggleScope?: () => void;
   onToggleSort?: () => void;
   onToggleNameFilter?: () => void;
@@ -307,16 +324,22 @@ class FastResumeSessionList implements Component {
     this.searchInput.focused = v;
   }
 
-  constructor(theme: Theme, currentSessionPath: string | undefined) {
+  constructor(theme: Theme, currentSessionFilePath: string | undefined) {
     this.theme = theme;
-    this.currentSessionPath = currentSessionPath;
+    this.currentSessionCanonicalPath = canonicalizePath(currentSessionFilePath ?? "");
     this.searchInput = new Input();
 
     this.searchInput.onSubmit = () => {
-      if (this.filteredSessions[this.selectedIndex]) {
-        this.onSelect?.(this.filteredSessions[this.selectedIndex]!.path);
+      const selected = this.filteredNodes[this.selectedIndex];
+      if (selected) {
+        this.onSelect?.(selected.session.path);
       }
     };
+  }
+
+  private isCurrentSessionPath(path: string): boolean {
+    if (!this.currentSessionCanonicalPath) return false;
+    return (canonicalizePath(path) ?? path) === this.currentSessionCanonicalPath;
   }
 
   setSortMode(sortMode: SortMode): void {
@@ -341,41 +364,45 @@ class FastResumeSessionList implements Component {
   }
 
   startDeleteConfirmationForSelectedSession(): void {
-    const selected = this.filteredSessions[this.selectedIndex];
+    const selected = this.filteredNodes[this.selectedIndex];
     if (!selected) return;
-    if (selected.path === this.currentSessionPath) {
+    if (this.isCurrentSessionPath(selected.session.path)) {
       this.onError?.("Cannot delete the currently active session");
       return;
     }
-    this.setConfirmingDeletePath(selected.path);
+    this.setConfirmingDeletePath(selected.session.path);
   }
 
-  private applyNameFilter(sessions: SessionHeader[]): SessionHeader[] {
-    if (this.nameFilter === "all") return sessions;
-    return sessions.filter(hasSessionName);
+  getSelectedSessionPath(): string | undefined {
+    const selected = this.filteredNodes[this.selectedIndex];
+    return selected?.session.path;
   }
 
   filterSessions(query: string): void {
-    const nameFiltered = this.applyNameFilter(this.allSessions);
+    const nameFiltered = this.nameFilter === "all"
+      ? this.allSessions
+      : this.allSessions.filter(hasSessionName);
+
     const trimmed = query.trim();
 
-    if (trimmed) {
-      // With a query, fuzzyFilter handles relevance scoring
-      this.filteredSessions = fuzzyFilter(
-        nameFiltered,
-        trimmed,
-        (s) => `${s.name ?? ""} ${s.firstMessage} ${s.cwd} ${s.id}`,
-      );
+    if (this.sortMode === "threaded" && !trimmed) {
+      // Threaded mode without search: show tree structure
+      const roots = buildSessionTree(nameFiltered);
+      this.filteredNodes = flattenSessionTree(roots);
     } else {
-      // No query: respect sort mode
-      // "threaded" and "recent" both keep mtime order (descending)
-      // "fuzzy" also keeps mtime order (no query to score by)
-      this.filteredSessions = [...nameFiltered];
+      // Other modes or with search: flat list via filterAndSortSessions
+      const filtered = filterAndSortSessions(nameFiltered, query, this.sortMode);
+      this.filteredNodes = filtered.map((session) => ({
+        session,
+        depth: 0,
+        isLast: true,
+        ancestorContinues: [],
+      }));
     }
 
     this.selectedIndex = Math.min(
       this.selectedIndex,
-      Math.max(0, this.filteredSessions.length - 1),
+      Math.max(0, this.filteredNodes.length - 1),
     );
   }
 
@@ -391,7 +418,7 @@ class FastResumeSessionList implements Component {
     lines.push(...this.searchInput.render(width));
     lines.push(""); // Blank line after search
 
-    if (this.filteredSessions.length === 0) {
+    if (this.filteredNodes.length === 0) {
       let emptyMessage: string;
       if (this.nameFilter === "named") {
         const toggleKey = keyText("app.session.toggleNamedFilter");
@@ -414,20 +441,24 @@ class FastResumeSessionList implements Component {
       0,
       Math.min(
         this.selectedIndex - Math.floor(this.maxVisible / 2),
-        this.filteredSessions.length - this.maxVisible,
+        this.filteredNodes.length - this.maxVisible,
       ),
     );
-    const endIndex = Math.min(startIndex + this.maxVisible, this.filteredSessions.length);
+    const endIndex = Math.min(startIndex + this.maxVisible, this.filteredNodes.length);
 
     for (let i = startIndex; i < endIndex; i++) {
-      const session = this.filteredSessions[i]!;
+      const node = this.filteredNodes[i]!;
+      const session = node.session;
       const isSelected = i === this.selectedIndex;
       const isConfirmingDelete = session.path === this.confirmingDeletePath;
-      const isCurrent = session.path === this.currentSessionPath;
+      const isCurrent = this.isCurrentSessionPath(session.path);
       const hasName = !!session.name;
 
+      // Build tree prefix
+      const prefix = buildTreePrefix(node);
+
       // Session display text
-      const displayText = (session.name ?? session.firstMessage ?? "(empty)")
+      const displayText = (session.name ?? session.firstMessage)
         .replace(/[\x00-\x1f\x7f]/g, " ")
         .trim();
 
@@ -446,8 +477,9 @@ class FastResumeSessionList implements Component {
       const cursor = isSelected ? t.fg("accent", "› ") : "  ";
 
       // Calculate available width for message
+      const prefixWidth = visibleWidth(prefix);
       const rightWidth = visibleWidth(rightPart) + 2;
-      const availableForMsg = width - 2 - rightWidth; // -2 for cursor
+      const availableForMsg = width - 2 - prefixWidth - rightWidth; // -2 for cursor
       const truncatedMsg = truncateToWidth(displayText, Math.max(10, availableForMsg), "…");
 
       // Style message — same color logic as built-in
@@ -465,7 +497,7 @@ class FastResumeSessionList implements Component {
       }
 
       // Build line — same layout as built-in
-      const leftPart = cursor + styledMsg;
+      const leftPart = cursor + t.fg("dim", prefix) + styledMsg;
       const leftWidth = visibleWidth(leftPart);
       const spacing = Math.max(1, width - leftWidth - visibleWidth(rightPart));
       const styledRight = t.fg(isConfirmingDelete ? "error" : "dim", rightPart);
@@ -477,8 +509,8 @@ class FastResumeSessionList implements Component {
     }
 
     // Scroll indicator
-    if (startIndex > 0 || endIndex < this.filteredSessions.length) {
-      const scrollText = `  (${this.selectedIndex + 1}/${this.filteredSessions.length})`;
+    if (startIndex > 0 || endIndex < this.filteredNodes.length) {
+      const scrollText = `  (${this.selectedIndex + 1}/${this.filteredNodes.length})`;
       lines.push(t.fg("muted", truncateToWidth(scrollText, width, "")));
     }
 
@@ -534,9 +566,9 @@ class FastResumeSessionList implements Component {
 
     // Ctrl+R: rename selected session
     if (kb.matches(data, "app.session.rename")) {
-      const selected = this.filteredSessions[this.selectedIndex];
+      const selected = this.filteredNodes[this.selectedIndex];
       if (selected) {
-        this.onRenameSession?.(selected.path);
+        this.onRenameSession?.(selected.session.path);
       }
       return;
     }
@@ -555,15 +587,15 @@ class FastResumeSessionList implements Component {
     if (kb.matches(data, "tui.select.up")) {
       this.selectedIndex = Math.max(0, this.selectedIndex - 1);
     } else if (kb.matches(data, "tui.select.down")) {
-      this.selectedIndex = Math.min(this.filteredSessions.length - 1, this.selectedIndex + 1);
+      this.selectedIndex = Math.min(this.filteredNodes.length - 1, this.selectedIndex + 1);
     } else if (kb.matches(data, "tui.select.pageUp")) {
       this.selectedIndex = Math.max(0, this.selectedIndex - this.maxVisible);
     } else if (kb.matches(data, "tui.select.pageDown")) {
-      this.selectedIndex = Math.min(this.filteredSessions.length - 1, this.selectedIndex + this.maxVisible);
+      this.selectedIndex = Math.min(this.filteredNodes.length - 1, this.selectedIndex + this.maxVisible);
     } else if (kb.matches(data, "tui.select.confirm")) {
-      const selected = this.filteredSessions[this.selectedIndex];
+      const selected = this.filteredNodes[this.selectedIndex];
       if (selected && this.onSelect) {
-        this.onSelect(selected.path);
+        this.onSelect(selected.session.path);
       }
     } else if (kb.matches(data, "tui.select.cancel")) {
       this.onCancel?.();
@@ -668,6 +700,11 @@ class FastResumePicker extends Container {
       this.done({ sessionPath, cancelled: false });
     };
     this.sessionList.onCancel = () => {
+      this.header.clearStatusTimeout();
+      this.loadingAbort?.abort();
+      this.done({ cancelled: true });
+    };
+    this.sessionList.onExit = () => {
       this.header.clearStatusTimeout();
       this.loadingAbort?.abort();
       this.done({ cancelled: true });
@@ -807,11 +844,29 @@ class FastResumePicker extends Container {
           this.header.loading = false;
           this.sessionList.setSessions(this.allSessions, true);
           this.tuiRequestRender();
+
+          // Auto-dismiss if no sessions exist anywhere
+          if (this.allSessions.length === 0 && (this.currentSessions?.length ?? 0) === 0) {
+            this.done({ cancelled: true });
+          }
         }
         return;
       }
 
-      const headers = loadSessionHeaders(batch);
+      let headers: SessionHeader[];
+      try {
+        headers = loadSessionHeaders(batch);
+      } catch (err) {
+        const message = err instanceof Error ? err.message : String(err);
+        this.allLoading = false;
+        if (this.scope === "all") {
+          this.header.loading = false;
+          this.header.setStatusMessage({ type: "error", message: `Failed to load sessions: ${message}` }, 4000);
+          this.tuiRequestRender();
+        }
+        return;
+      }
+
       allParsed.push(...headers);
 
       // If we're currently showing "all" scope, update progress
@@ -857,7 +912,8 @@ class FastResumePicker extends Container {
   }
 
   private toggleSortMode(): void {
-    this.sortMode = this.sortMode === "threaded" ? "recent" : this.sortMode === "recent" ? "fuzzy" : "threaded";
+    // Cycle: threaded → recent → relevance → threaded
+    this.sortMode = this.sortMode === "threaded" ? "recent" : this.sortMode === "recent" ? "relevance" : "threaded";
     this.header.sortMode = this.sortMode;
     this.sessionList.setSortMode(this.sortMode);
     this.tuiRequestRender();

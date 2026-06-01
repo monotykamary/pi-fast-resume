@@ -1,4 +1,4 @@
-import { openSync, readSync, closeSync, readdirSync, statSync } from "node:fs";
+import { openSync, readSync, closeSync, readdirSync, statSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
@@ -264,6 +264,18 @@ export function filterByCwd(
     if (!s.cwd) return false;
     return resolve(s.cwd) === resolvedCwd;
   });
+}
+
+/**
+ * Canonicalize a file path by resolving symlinks.
+ * Matches pi-core's canonicalizePath behavior (realpathSync with fallback).
+ */
+export function canonicalizePath(path: string): string {
+  try {
+    return realpathSync(path);
+  } catch {
+    return path;
+  }
 }
 
 export function matchQuery(

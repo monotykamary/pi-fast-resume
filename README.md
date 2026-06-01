@@ -16,7 +16,7 @@ _Reads 16KB per file instead of the full JSONL — first results in **6ms**._
 > **`/resume` takes 5.6 seconds** when you have 1,700+ sessions.
 > pi-fast-resume's `/fast-resume` takes **6 milliseconds**.
 
-Same result — the exact same session picker UI you know from `/resume`. The difference is pi-fast-resume never reads beyond the first 16KB of any session file. Headers, names, first messages — they all live in the first few lines. Everything after that is full message history the picker never shows.
+Same picker UI and keybindings as `/resume`. The difference is pi-fast-resume never reads beyond the first 16KB of any session file. Headers, names, first messages — they all live in the first few lines. Everything after that is full message history the picker never shows. Search matches against the first message only (see [Known Limitations](#known-limitations)).
 
 ```
 ──────────────────────────────────────────────────────────
@@ -203,6 +203,16 @@ On load, the extension patches `InteractiveMode.prototype.showSessionSelector` t
 | [pi-session-manager](https://github.com/Dwsy/pi-session-manager) | Full desktop app (Tauri)       | External app, not integrated into pi              |
 
 None optimize the `/resume` picker itself — they either still fully parse every file or are standalone applications.
+
+## Known Limitations
+
+The 16KB partial-read tradeoff that gives pi-fast-resume its speed comes with one functional gap vs. the built-in `/resume`:
+
+| Area | Built-in `/resume` | pi-fast-resume | Impact |
+| ---- | ------------------ | -------------- | ------ |
+| **Search depth** | Matches against **all messages** in every session (`allMessagesText`) | Matches against **first message only** (`firstMessage`) + name + id + cwd | A query like `fix oauth` won't find a session where "fix oauth" appears in the 5th message but not the 1st. Name/id/cwd matches still work. |
+
+All other features — tree view, regex/exact-phrase search, sort modes, scope toggle, delete, rename, path display — are identical to the built-in picker.
 
 ## License
 

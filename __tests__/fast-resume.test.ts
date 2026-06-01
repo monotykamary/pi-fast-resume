@@ -4,6 +4,7 @@ import {
   sortByModified,
   filterByCwd,
   matchQuery,
+  canonicalizePath,
   scanAllSessionDirs,
   scanSessionDir,
   type SessionHeader,
@@ -15,6 +16,17 @@ import {
   moveSelection,
   setSessions,
 } from "../src/picker-state.js";
+import {
+  parseSearchQuery,
+  matchSession,
+  hasSessionName,
+  filterAndSortSessions,
+  buildSessionTree,
+  flattenSessionTree,
+  buildTreePrefix,
+  type FlatSessionNode,
+  type SortMode,
+} from "../src/search.js";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -115,7 +127,6 @@ describe("parseSessionFromBuffer", () => {
     expect(result!.messageCount).toBe(3);
   });
 
-  // lastActivityTime — pi-core priority: message.timestamp > header.timestamp > stat mtime
   it("prefers message timestamp over stat mtime for modified time", () => {
     const jsonl = [
       JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
@@ -123,12 +134,10 @@ describe("parseSessionFromBuffer", () => {
     ].join("\n");
 
     const buf = Buffer.from(jsonl);
-    // stat mtime is a week earlier than the message timestamp
     const statMtime = 1704716400000;
     const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime);
 
     expect(result).not.toBeNull();
-    // Should use message timestamp (1705321200000), not stat mtime
     expect(result!.modified.getTime()).toBe(1705321200000);
   });
 
@@ -154,7 +163,6 @@ describe("parseSessionFromBuffer", () => {
     ].join("\n");
 
     const buf = Buffer.from(jsonl);
-    // stat mtime is after header, but header timestamp should win
     const statMtime = new Date("2026-06-01T00:00:00Z").getTime();
     const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime);
 
@@ -205,7 +213,6 @@ describe("parseSessionFromBuffer", () => {
     expect(result!.modified.getTime()).toBe(expectedTime);
   });
 
-  // Partial read — stat mtime takes priority when data is incomplete
   it("uses stat mtime for modified time on partial reads", () => {
     const jsonl = [
       JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
@@ -213,12 +220,10 @@ describe("parseSessionFromBuffer", () => {
     ].join("\n");
 
     const buf = Buffer.from(jsonl);
-    // Message timestamp is 1705321200000, stat mtime is much later
     const statMtime = 1705400000000;
     const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime, true);
 
     expect(result).not.toBeNull();
-    // Partial read: stat mtime should win over message timestamp
     expect(result!.modified.getTime()).toBe(statMtime);
   });
 
@@ -229,12 +234,10 @@ describe("parseSessionFromBuffer", () => {
     ].join("\n");
 
     const buf = Buffer.from(jsonl);
-    const statMtime = 1705400000000; // Much later than message timestamp
+    const statMtime = 1705400000000;
     const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime, true);
 
     expect(result).not.toBeNull();
-    // Even though message timestamp (1000) would win on full read,
-    // partial reads trust stat mtime since it reflects the true last write
     expect(result!.modified.getTime()).toBe(statMtime);
   });
 
@@ -245,15 +248,13 @@ describe("parseSessionFromBuffer", () => {
     ].join("\n");
 
     const buf = Buffer.from(jsonl);
-    const statMtime = 1704716400000; // Earlier than message timestamp
-    // partial defaults to false
+    const statMtime = 1704716400000;
     const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime);
 
     expect(result).not.toBeNull();
     expect(result!.modified.getTime()).toBe(1705321200000);
   });
 
-  // StringDecoder — multi-byte safety at buffer boundaries
   it("correctly decodes complete multi-byte characters within the buffer", () => {
     const name = "日本語テスト";
     const jsonl = [
@@ -283,24 +284,41 @@ describe("parseSessionFromBuffer", () => {
   });
 
   it("gracefully handles a multi-byte character split at the buffer boundary", () => {
-    // Build a session with a multi-byte name, then truncate the buffer
-    // so it splits a multi-byte character
     const name = "日本語テスト";
     const sessionLine = JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" });
     const infoLine = JSON.stringify({ type: "session_info", name });
     const full = sessionLine + "\n" + infoLine + "\n";
     const fullBuf = Buffer.from(full);
 
-    // The info line with Japanese chars is near the end — truncate 3 bytes
-    // to split the last multi-byte character
     const truncatedBytes = fullBuf.length - 3;
     const result = parseSessionFromBuffer(fullBuf, truncatedBytes, "/test/s.jsonl", 0);
 
-    // Session header should still parse correctly
     expect(result).not.toBeNull();
     expect(result!.id).toBe("x");
-    // The name line was truncated — JSON parse fails, name falls back to undefined
-    // This is expected: incomplete data at the boundary is skipped
+  });
+
+  it("extracts parentSessionPath from session header", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "child-1", timestamp: "2026-01-15T10:00:00Z", parentSession: "/parent/session.jsonl" }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/child/session.jsonl", 0);
+
+    expect(result).not.toBeNull();
+    expect(result!.parentSessionPath).toBe("/parent/session.jsonl");
+  });
+
+  it("returns undefined parentSessionPath when not present", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "orphan", timestamp: "2026-01-15T10:00:00Z" }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0);
+
+    expect(result).not.toBeNull();
+    expect(result!.parentSessionPath).toBeUndefined();
   });
 });
 
@@ -312,7 +330,6 @@ describe("scanAllSessionDirs / scanSessionDir", () => {
   });
 
   it("scanAllSessionDirs finds sessions across multiple subdirectories", () => {
-    // Create test structure: sessionsDir/sub1/file.jsonl, sessionsDir/sub2/file.jsonl
     mkdirSync(join(testDir, "sub1"), { recursive: true });
     mkdirSync(join(testDir, "sub2"), { recursive: true });
     writeFileSync(join(testDir, "sub1", "a.jsonl"), '{"type":"session","id":"1","timestamp":"2026-01-01T00:00:00Z"}\n');
@@ -375,12 +392,10 @@ describe("filterByCwd", () => {
   });
 
   it("resolves symlinks before comparing", () => {
-    // Even if paths differ textually, resolve() normalizes them
     const sessions = [
       makeSession({ cwd: "/Users/test/project" }),
     ];
 
-    // Both resolve to the same path
     expect(filterByCwd(sessions, "/Users/test/project")).toHaveLength(1);
   });
 
@@ -416,6 +431,388 @@ describe("matchQuery", () => {
   it("matches against id", () => {
     const session = makeSession({ id: "abc-123-def" });
     expect(matchQuery(session, "abc-123")).toBe(true);
+  });
+});
+
+describe("canonicalizePath", () => {
+  it("canonicalizes an existing path", () => {
+    const result = canonicalizePath(process.cwd());
+    expect(result).toBe(process.cwd());
+  });
+
+  it("returns the path unchanged for nonexistent paths", () => {
+    const nonexistent = "/this/path/does/not/exist/abc123";
+    const result = canonicalizePath(nonexistent);
+    expect(result).toBe(nonexistent);
+  });
+});
+
+// Search module tests
+
+describe("parseSearchQuery", () => {
+  it("returns empty tokens for empty query", () => {
+    const result = parseSearchQuery("");
+    expect(result.mode).toBe("tokens");
+    expect(result.tokens).toHaveLength(0);
+  });
+
+  it("parses fuzzy tokens separated by whitespace", () => {
+    const result = parseSearchQuery("foo bar");
+    expect(result.mode).toBe("tokens");
+    expect(result.tokens).toHaveLength(2);
+    expect(result.tokens[0]).toEqual({ kind: "fuzzy", value: "foo" });
+    expect(result.tokens[1]).toEqual({ kind: "fuzzy", value: "bar" });
+  });
+
+  it("parses regex mode with re: prefix", () => {
+    const result = parseSearchQuery("re:auth.*bug");
+    expect(result.mode).toBe("regex");
+    expect(result.regex).not.toBeNull();
+    expect(result.regex!.source).toBe("auth.*bug");
+  });
+
+  it("returns error for invalid regex", () => {
+    const result = parseSearchQuery("re:([invalid");
+    expect(result.mode).toBe("regex");
+    expect(result.error).toBeTruthy();
+    expect(result.regex).toBeNull();
+  });
+
+  it("returns error for empty regex", () => {
+    const result = parseSearchQuery("re:");
+    expect(result.error).toBe("Empty regex");
+  });
+
+  it("parses exact phrase in double quotes", () => {
+    const result = parseSearchQuery('"node cve" bug');
+    expect(result.mode).toBe("tokens");
+    expect(result.tokens).toHaveLength(2);
+    expect(result.tokens[0]).toEqual({ kind: "phrase", value: "node cve" });
+    expect(result.tokens[1]).toEqual({ kind: "fuzzy", value: "bug" });
+  });
+
+  it("handles unclosed quotes by falling back to fuzzy tokens", () => {
+    const result = parseSearchQuery('"unclosed phrase');
+    expect(result.mode).toBe("tokens");
+    // Falls back to whitespace split — all fuzzy
+    expect(result.tokens.every((t) => t.kind === "fuzzy")).toBe(true);
+  });
+
+  it("parses multiple quoted phrases", () => {
+    const result = parseSearchQuery('"hello world" "foo bar"');
+    expect(result.tokens).toHaveLength(2);
+    expect(result.tokens[0]).toEqual({ kind: "phrase", value: "hello world" });
+    expect(result.tokens[1]).toEqual({ kind: "phrase", value: "foo bar" });
+  });
+});
+
+describe("matchSession", () => {
+  it("matches everything with empty tokens", () => {
+    const session = makeSession();
+    const parsed = parseSearchQuery("");
+    expect(matchSession(session, parsed).matches).toBe(true);
+  });
+
+  it("fuzzy matches against session text", () => {
+    const session = makeSession({ firstMessage: "Fix auth bypass", id: "abc-123" });
+    const parsed = parseSearchQuery("auth");
+    expect(matchSession(session, parsed).matches).toBe(true);
+  });
+
+  it("rejects non-matching fuzzy token", () => {
+    const session = makeSession({ firstMessage: "Fix auth bypass" });
+    const parsed = parseSearchQuery("xyz");
+    expect(matchSession(session, parsed).matches).toBe(false);
+  });
+
+  it("all tokens must match", () => {
+    const session = makeSession({ firstMessage: "Fix auth bypass in middleware", id: "abc" });
+    const parsed = parseSearchQuery("auth bypass");
+    expect(matchSession(session, parsed).matches).toBe(true);
+
+    const parsed2 = parseSearchQuery("auth quantum");
+    expect(matchSession(session, parsed2).matches).toBe(false);
+  });
+
+  it("matches regex queries", () => {
+    const session = makeSession({ firstMessage: "Fix the auth bypass" });
+    const parsed = parseSearchQuery("re:auth.*bypass");
+    expect(matchSession(session, parsed).matches).toBe(true);
+  });
+
+  it("rejects non-matching regex", () => {
+    const session = makeSession({ firstMessage: "Fix the auth bypass" });
+    const parsed = parseSearchQuery("re:quantum");
+    expect(matchSession(session, parsed).matches).toBe(false);
+  });
+
+  it("matches exact phrases", () => {
+    const session = makeSession({ firstMessage: "Fix the node cve vulnerability" });
+    const parsed = parseSearchQuery('"node cve"');
+    expect(matchSession(session, parsed).matches).toBe(true);
+  });
+
+  it("rejects non-matching exact phrases", () => {
+    const session = makeSession({ firstMessage: "Fix the auth bypass" });
+    const parsed = parseSearchQuery('"node cve"');
+    expect(matchSession(session, parsed).matches).toBe(false);
+  });
+
+  it("returns a score for ranking", () => {
+    const session = makeSession({ firstMessage: "Fix auth bug" });
+    const parsed = parseSearchQuery("auth");
+    const result = matchSession(session, parsed);
+    expect(result.matches).toBe(true);
+    expect(typeof result.score).toBe("number");
+  });
+});
+
+describe("hasSessionName", () => {
+  it("returns true for named sessions", () => {
+    expect(hasSessionName(makeSession({ name: "My Session" }))).toBe(true);
+  });
+
+  it("returns false for unnamed sessions", () => {
+    expect(hasSessionName(makeSession())).toBe(false);
+  });
+
+  it("returns false for whitespace-only names", () => {
+    expect(hasSessionName(makeSession({ name: "   " }))).toBe(false);
+  });
+});
+
+describe("filterAndSortSessions", () => {
+  const sessions = [
+    makeSession({ id: "1", firstMessage: "Fix auth bypass", modified: new Date("2026-01-03") }),
+    makeSession({ id: "2", firstMessage: "Add rate limiting", modified: new Date("2026-01-02") }),
+    makeSession({ id: "3", firstMessage: "Refactor user service", modified: new Date("2026-01-01") }),
+  ];
+
+  it("returns all sessions with no query", () => {
+    const result = filterAndSortSessions(sessions, "", "threaded");
+    expect(result).toHaveLength(3);
+  });
+
+  it("filters by fuzzy query", () => {
+    const result = filterAndSortSessions(sessions, "auth", "relevance");
+    expect(result).toHaveLength(1);
+    expect(result[0]!.id).toBe("1");
+  });
+
+  it("recent mode filters but keeps incoming order", () => {
+    const result = filterAndSortSessions(sessions, "auth", "recent");
+    expect(result).toHaveLength(1);
+    expect(result[0]!.id).toBe("1");
+  });
+
+  it("relevance mode sorts by score then by modified desc", () => {
+    const manySessions = [
+      makeSession({ id: "1", firstMessage: "Fix auth bypass in middleware", modified: new Date("2026-01-01") }),
+      makeSession({ id: "2", firstMessage: "Add rate limiting to API", modified: new Date("2026-01-02") }),
+    ];
+
+    const result = filterAndSortSessions(manySessions, "auth", "relevance");
+    // Only session 1 matches "auth"
+    expect(result).toHaveLength(1);
+    expect(result[0]!.id).toBe("1");
+  });
+
+  it("tie-breaks by modified desc when scores are equal", () => {
+    const manySessions = [
+      makeSession({ id: "1", firstMessage: "auth stuff", name: "auth", modified: new Date("2026-01-01") }),
+      makeSession({ id: "2", firstMessage: "auth stuff", name: "auth", modified: new Date("2026-01-03") }),
+    ];
+
+    const result = filterAndSortSessions(manySessions, "auth", "relevance");
+    expect(result).toHaveLength(2);
+    // Same score, newer comes first
+    expect(result[0]!.id).toBe("2");
+  });
+
+  it("applies name filter", () => {
+    const named = [
+      makeSession({ id: "1", firstMessage: "Fix bug", name: "Bug fix" }),
+      makeSession({ id: "2", firstMessage: "Add feature" }),
+    ];
+
+    const result = filterAndSortSessions(named, "", "threaded", "named");
+    expect(result).toHaveLength(1);
+    expect(result[0]!.id).toBe("1");
+  });
+
+  it("returns empty for invalid regex", () => {
+    const result = filterAndSortSessions(sessions, "re:([invalid", "relevance");
+    expect(result).toHaveLength(0);
+  });
+});
+
+describe("Session tree", () => {
+  it("builds flat tree for sessions without parents", () => {
+    const sessions = [
+      makeSession({ path: "/a.jsonl", modified: new Date("2026-01-02") }),
+      makeSession({ path: "/b.jsonl", modified: new Date("2026-01-03") }),
+      makeSession({ path: "/c.jsonl", modified: new Date("2026-01-01") }),
+    ];
+
+    const roots = buildSessionTree(sessions);
+    // All are roots since no parentSessionPath
+    expect(roots).toHaveLength(3);
+    // Sorted by modified desc
+    expect(roots[0]!.session.path).toBe("/b.jsonl");
+    expect(roots[1]!.session.path).toBe("/a.jsonl");
+    expect(roots[2]!.session.path).toBe("/c.jsonl");
+  });
+
+  it("builds parent-child hierarchy", () => {
+    const sessions = [
+      makeSession({ path: "/parent.jsonl", id: "parent", modified: new Date("2026-01-01") }),
+      makeSession({ path: "/child1.jsonl", id: "child1", parentSessionPath: "/parent.jsonl", modified: new Date("2026-01-02") }),
+      makeSession({ path: "/child2.jsonl", id: "child2", parentSessionPath: "/parent.jsonl", modified: new Date("2026-01-03") }),
+    ];
+
+    const roots = buildSessionTree(sessions);
+    expect(roots).toHaveLength(1);
+    expect(roots[0]!.session.path).toBe("/parent.jsonl");
+    expect(roots[0]!.children).toHaveLength(2);
+    // Children sorted by modified desc
+    expect(roots[0]!.children[0]!.session.id).toBe("child2");
+    expect(roots[0]!.children[1]!.session.id).toBe("child1");
+  });
+
+  it("handles orphan children (parent not in set)", () => {
+    const sessions = [
+      makeSession({ path: "/orphan.jsonl", id: "orphan", parentSessionPath: "/missing.jsonl", modified: new Date("2026-01-01") }),
+    ];
+
+    const roots = buildSessionTree(sessions);
+    // Orphan becomes a root
+    expect(roots).toHaveLength(1);
+    expect(roots[0]!.session.id).toBe("orphan");
+  });
+
+  it("supports deep nesting", () => {
+    const sessions = [
+      makeSession({ path: "/a.jsonl", id: "a", modified: new Date("2026-01-01") }),
+      makeSession({ path: "/b.jsonl", id: "b", parentSessionPath: "/a.jsonl", modified: new Date("2026-01-02") }),
+      makeSession({ path: "/c.jsonl", id: "c", parentSessionPath: "/b.jsonl", modified: new Date("2026-01-03") }),
+    ];
+
+    const roots = buildSessionTree(sessions);
+    expect(roots).toHaveLength(1);
+    expect(roots[0]!.session.id).toBe("a");
+    expect(roots[0]!.children[0]!.session.id).toBe("b");
+    expect(roots[0]!.children[0]!.children[0]!.session.id).toBe("c");
+  });
+});
+
+describe("flattenSessionTree", () => {
+  it("flattens a flat list of roots", () => {
+    const sessions = [
+      makeSession({ path: "/a.jsonl", id: "a", modified: new Date("2026-01-02") }),
+      makeSession({ path: "/b.jsonl", id: "b", modified: new Date("2026-01-01") }),
+    ];
+
+    const roots = buildSessionTree(sessions);
+    const flat = flattenSessionTree(roots);
+
+    expect(flat).toHaveLength(2);
+    expect(flat[0]!.session.id).toBe("a");
+    expect(flat[0]!.depth).toBe(0);
+    expect(flat[1]!.session.id).toBe("b");
+    expect(flat[1]!.depth).toBe(0);
+  });
+
+  it("flattens a tree with children", () => {
+    const sessions = [
+      makeSession({ path: "/parent.jsonl", id: "parent", modified: new Date("2026-01-01") }),
+      makeSession({ path: "/child1.jsonl", id: "child1", parentSessionPath: "/parent.jsonl", modified: new Date("2026-01-02") }),
+      makeSession({ path: "/child2.jsonl", id: "child2", parentSessionPath: "/parent.jsonl", modified: new Date("2026-01-03") }),
+    ];
+
+    const roots = buildSessionTree(sessions);
+    const flat = flattenSessionTree(roots);
+
+    expect(flat).toHaveLength(3);
+    expect(flat[0]!.session.id).toBe("parent");
+    expect(flat[0]!.depth).toBe(0);
+    expect(flat[1]!.session.id).toBe("child2");
+    expect(flat[1]!.depth).toBe(1);
+    expect(flat[2]!.session.id).toBe("child1");
+    expect(flat[2]!.depth).toBe(1);
+
+    // Verify tree prefixes match upstream behavior
+    expect(buildTreePrefix(flat[0]!)).toBe(""); // depth 0 → no prefix
+    // Children sorted by modified desc: child2 (Jan 3) first = not last, child1 (Jan 2) = last
+    expect(buildTreePrefix(flat[1]!)).toBe("   ├─ "); // depth 1, not last child (child2)
+    expect(buildTreePrefix(flat[2]!)).toBe("   └─ "); // depth 1, last child (child1)
+  });
+
+  it("tracks isLast correctly", () => {
+    const sessions = [
+      makeSession({ path: "/parent.jsonl", id: "parent", modified: new Date("2026-01-01") }),
+      makeSession({ path: "/child.jsonl", id: "child", parentSessionPath: "/parent.jsonl", modified: new Date("2026-01-02") }),
+    ];
+
+    const roots = buildSessionTree(sessions);
+    const flat = flattenSessionTree(roots);
+
+    expect(flat[0]!.isLast).toBe(true); // parent is last root
+    expect(flat[1]!.isLast).toBe(true); // child is last (only) child
+  });
+});
+
+describe("buildTreePrefix", () => {
+  it("returns empty string for depth 0", () => {
+    const node: FlatSessionNode = {
+      session: makeSession(),
+      depth: 0,
+      isLast: true,
+      ancestorContinues: [],
+    };
+    expect(buildTreePrefix(node)).toBe("");
+  });
+
+  it("returns └─ for last child at depth 1", () => {
+    const node: FlatSessionNode = {
+      session: makeSession(),
+      depth: 1,
+      isLast: true,
+      ancestorContinues: [false],
+    };
+    // ancestorContinues[0] = false → "   " (root parent doesn't continue)
+    expect(buildTreePrefix(node)).toBe("   └─ ");
+  });
+
+  it("returns ├─ for non-last child at depth 1", () => {
+    const node: FlatSessionNode = {
+      session: makeSession(),
+      depth: 1,
+      isLast: false,
+      ancestorContinues: [false],
+    };
+    expect(buildTreePrefix(node)).toBe("   ├─ ");
+  });
+
+  it("returns │  for continuing ancestor", () => {
+    const node: FlatSessionNode = {
+      session: makeSession(),
+      depth: 2,
+      isLast: true,
+      ancestorContinues: [false, true],
+    };
+    // ancestorContinues[0] = false → "   " (root doesn't continue)
+    // ancestorContinues[1] = true → "│  " (parent continues)
+    expect(buildTreePrefix(node)).toBe("   │  └─ ");
+  });
+
+  it("renders deep nested structure correctly", () => {
+    const node: FlatSessionNode = {
+      session: makeSession(),
+      depth: 3,
+      isLast: false,
+      ancestorContinues: [false, true, true],
+    };
+    expect(buildTreePrefix(node)).toBe("   │  │  ├─ ");
   });
 });
 
