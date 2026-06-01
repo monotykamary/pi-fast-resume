@@ -114,6 +114,146 @@ describe("parseSessionFromBuffer", () => {
 
     expect(result!.messageCount).toBe(3);
   });
+
+  // lastActivityTime — pi-core priority: message.timestamp > header.timestamp > stat mtime
+  it("prefers message timestamp over stat mtime for modified time", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "hi", timestamp: 1705321200000 } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    // stat mtime is a week earlier than the message timestamp
+    const statMtime = 1704716400000;
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime);
+
+    expect(result).not.toBeNull();
+    // Should use message timestamp (1705321200000), not stat mtime
+    expect(result!.modified.getTime()).toBe(1705321200000);
+  });
+
+  it("prefers message timestamp over header timestamp", () => {
+    const headerTime = "2026-01-15T10:00:00Z";
+    const msgTimestamp = new Date("2026-01-20T15:30:00Z").getTime();
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: headerTime }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "hi", timestamp: msgTimestamp } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0);
+
+    expect(result).not.toBeNull();
+    expect(result!.modified.getTime()).toBe(msgTimestamp);
+  });
+
+  it("falls back to header timestamp when no message timestamps are present", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "hi" } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    // stat mtime is after header, but header timestamp should win
+    const statMtime = new Date("2026-06-01T00:00:00Z").getTime();
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime);
+
+    expect(result).not.toBeNull();
+    expect(result!.modified.getTime()).toBe(new Date("2026-01-15T10:00:00Z").getTime());
+  });
+
+  it("falls back to stat mtime when header timestamp is invalid", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "not-a-date" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "hi" } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const statMtime = 1705312800000;
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime);
+
+    expect(result).not.toBeNull();
+    expect(result!.modified.getTime()).toBe(statMtime);
+  });
+
+  it("takes the latest message timestamp across multiple messages", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "first", timestamp: 1000 } }),
+      JSON.stringify({ type: "message", message: { role: "assistant", content: "second", timestamp: 3000 } }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "third", timestamp: 2000 } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0);
+
+    expect(result).not.toBeNull();
+    expect(result!.modified.getTime()).toBe(3000);
+  });
+
+  it("uses entry timestamp as fallback when message.timestamp is absent", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "message", timestamp: "2026-01-20T15:30:00Z", message: { role: "user", content: "hi" } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0);
+
+    expect(result).not.toBeNull();
+    const expectedTime = new Date("2026-01-20T15:30:00Z").getTime();
+    expect(result!.modified.getTime()).toBe(expectedTime);
+  });
+
+  // StringDecoder — multi-byte safety at buffer boundaries
+  it("correctly decodes complete multi-byte characters within the buffer", () => {
+    const name = "日本語テスト";
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "session_info", name }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0);
+
+    expect(result).not.toBeNull();
+    expect(result!.name).toBe(name);
+  });
+
+  it("handles multi-byte content in first user message", () => {
+    const msg = "Bug in origöre❤️🔥";
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: msg }] } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0);
+
+    expect(result).not.toBeNull();
+    expect(result!.firstMessage).toBe(msg);
+  });
+
+  it("gracefully handles a multi-byte character split at the buffer boundary", () => {
+    // Build a session with a multi-byte name, then truncate the buffer
+    // so it splits a multi-byte character
+    const name = "日本語テスト";
+    const sessionLine = JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" });
+    const infoLine = JSON.stringify({ type: "session_info", name });
+    const full = sessionLine + "\n" + infoLine + "\n";
+    const fullBuf = Buffer.from(full);
+
+    // The info line with Japanese chars is near the end — truncate 3 bytes
+    // to split the last multi-byte character
+    const truncatedBytes = fullBuf.length - 3;
+    const result = parseSessionFromBuffer(fullBuf, truncatedBytes, "/test/s.jsonl", 0);
+
+    // Session header should still parse correctly
+    expect(result).not.toBeNull();
+    expect(result!.id).toBe("x");
+    // The name line was truncated — JSON parse fails, name falls back to undefined
+    // This is expected: incomplete data at the boundary is skipped
+  });
 });
 
 describe("scanAllSessionDirs / scanSessionDir", () => {

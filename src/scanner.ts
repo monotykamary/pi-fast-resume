@@ -1,6 +1,7 @@
 import { openSync, readSync, closeSync, readdirSync, statSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { homedir } from "node:os";
+import { StringDecoder } from "node:string_decoder";
 
 export interface SessionHeader {
   path: string;
@@ -38,13 +39,15 @@ export function parseSessionFromBuffer(
   filePath: string,
   mtimeMs: number,
 ): SessionHeader | null {
-  const text = buf.toString("utf8", 0, bytesRead);
+  const decoder = new StringDecoder("utf8");
+  const text = decoder.write(buf.subarray(0, bytesRead)) + decoder.end();
   const lines = text.split("\n");
 
   let header: { id: string; timestamp: string; cwd?: string; parentSession?: string } | null = null;
   let firstUserMsg = "";
   let name = "";
   let msgCount = 0;
+  let lastActivityTime: number | undefined;
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -61,9 +64,26 @@ export function parseSessionFromBuffer(
       }
       if (entry.type === "message") {
         msgCount++;
-        if (!firstUserMsg && entry.message?.role === "user") {
+
+        // Track last activity time from user/assistant messages
+        // Matches pi-core's getMessageActivityTime priority:
+        //   message.timestamp (number) > entry.timestamp (date string)
+        const msg = entry.message;
+        if (msg?.role === "user" || msg?.role === "assistant") {
+          const msgTimestamp = msg.timestamp;
+          if (typeof msgTimestamp === "number" && msgTimestamp > 0) {
+            lastActivityTime = Math.max(lastActivityTime ?? 0, msgTimestamp);
+          } else if (typeof entry.timestamp === "string") {
+            const t = new Date(entry.timestamp).getTime();
+            if (!Number.isNaN(t)) {
+              lastActivityTime = Math.max(lastActivityTime ?? 0, t);
+            }
+          }
+        }
+
+        if (!firstUserMsg && msg?.role === "user") {
           try {
-            firstUserMsg = extractTextFromContent(entry.message.content);
+            firstUserMsg = extractTextFromContent(msg.content);
           } catch {
             // Malformed content, skip
           }
@@ -76,13 +96,25 @@ export function parseSessionFromBuffer(
 
   if (!header) return null;
 
+  // Determine modified time using pi-core's priority:
+  //   message timestamp > header timestamp > stat mtime
+  // Note: partial reads may underestimate lastActivityTime for sessions
+  // larger than PARTIAL_READ_SIZE, since only the first 16KB is read.
+  const headerTime = typeof header.timestamp === "string" ? new Date(header.timestamp).getTime() : NaN;
+  const modified =
+    typeof lastActivityTime === "number" && lastActivityTime > 0
+      ? new Date(lastActivityTime)
+      : !Number.isNaN(headerTime)
+        ? new Date(headerTime)
+        : new Date(mtimeMs);
+
   return {
     path: filePath,
     id: header.id,
     cwd: header.cwd ?? "",
     parentSessionPath: header.parentSession || undefined,
     created: new Date(header.timestamp),
-    modified: new Date(mtimeMs),
+    modified,
     messageCount: msgCount,
     firstMessage: firstUserMsg || "",
     name: name || undefined,
