@@ -205,6 +205,54 @@ describe("parseSessionFromBuffer", () => {
     expect(result!.modified.getTime()).toBe(expectedTime);
   });
 
+  // Partial read — stat mtime takes priority when data is incomplete
+  it("uses stat mtime for modified time on partial reads", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "hi", timestamp: 1705321200000 } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    // Message timestamp is 1705321200000, stat mtime is much later
+    const statMtime = 1705400000000;
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime, true);
+
+    expect(result).not.toBeNull();
+    // Partial read: stat mtime should win over message timestamp
+    expect(result!.modified.getTime()).toBe(statMtime);
+  });
+
+  it("uses stat mtime on partial reads even when message timestamps are older", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "early msg", timestamp: 1000 } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const statMtime = 1705400000000; // Much later than message timestamp
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime, true);
+
+    expect(result).not.toBeNull();
+    // Even though message timestamp (1000) would win on full read,
+    // partial reads trust stat mtime since it reflects the true last write
+    expect(result!.modified.getTime()).toBe(statMtime);
+  });
+
+  it("full read still uses message timestamp over stat mtime", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "hi", timestamp: 1705321200000 } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const statMtime = 1704716400000; // Earlier than message timestamp
+    // partial defaults to false
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", statMtime);
+
+    expect(result).not.toBeNull();
+    expect(result!.modified.getTime()).toBe(1705321200000);
+  });
+
   // StringDecoder — multi-byte safety at buffer boundaries
   it("correctly decodes complete multi-byte characters within the buffer", () => {
     const name = "日本語テスト";

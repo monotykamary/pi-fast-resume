@@ -38,6 +38,7 @@ export function parseSessionFromBuffer(
   bytesRead: number,
   filePath: string,
   mtimeMs: number,
+  partial = false,
 ): SessionHeader | null {
   const decoder = new StringDecoder("utf8");
   const text = decoder.write(buf.subarray(0, bytesRead)) + decoder.end();
@@ -96,17 +97,26 @@ export function parseSessionFromBuffer(
 
   if (!header) return null;
 
-  // Determine modified time using pi-core's priority:
-  //   message timestamp > header timestamp > stat mtime
-  // Note: partial reads may underestimate lastActivityTime for sessions
-  // larger than PARTIAL_READ_SIZE, since only the first 16KB is read.
+  // Determine modified time:
+  //   - Full read: use pi-core's priority (message timestamp > header timestamp > stat mtime).
+  //     lastActivityTime is accurate since we saw every message.
+  //   - Partial read: stat mtime is more reliable than a partial lastActivityTime,
+  //     which only reflects messages in the first 16KB and may severely underestimate
+  //     the true last activity for large sessions.
   const headerTime = typeof header.timestamp === "string" ? new Date(header.timestamp).getTime() : NaN;
-  const modified =
-    typeof lastActivityTime === "number" && lastActivityTime > 0
-      ? new Date(lastActivityTime)
-      : !Number.isNaN(headerTime)
-        ? new Date(headerTime)
-        : new Date(mtimeMs);
+  let modified: Date;
+  if (partial) {
+    // Partial read — stat mtime is the most reliable signal
+    modified = new Date(mtimeMs);
+  } else {
+    // Full read — pi-core's priority chain
+    modified =
+      typeof lastActivityTime === "number" && lastActivityTime > 0
+        ? new Date(lastActivityTime)
+        : !Number.isNaN(headerTime)
+          ? new Date(headerTime)
+          : new Date(mtimeMs);
+  }
 
   return {
     path: filePath,
@@ -212,7 +222,7 @@ export function loadSessionHeader(
     const readSize = Math.min(PARTIAL_READ_SIZE, meta.size);
     const buf = Buffer.alloc(readSize);
     const bytesRead = readSync(fd, buf, 0, readSize, 0);
-    return parseSessionFromBuffer(buf, bytesRead, meta.path, meta.mtimeMs);
+    return parseSessionFromBuffer(buf, bytesRead, meta.path, meta.mtimeMs, meta.size > PARTIAL_READ_SIZE);
   } catch {
     return null;
   } finally {
