@@ -171,24 +171,24 @@ An indexed approach would be faster for subsequent queries, but at the cost of r
 
 pi's built-in `/resume` is handled inside the interactive mode's `onSubmit` callback — it returns early before extension commands or input events are ever checked. Extensions **cannot intercept built-in commands** directly.
 
-However, pi-fast-resume can **prototype-patch** `InteractiveMode.showSessionSelector` to intercept both the `/resume` command and the `app.session.resume` keybinding. When hijack mode is active:
+However, pi-fast-resume can **prototype-patch** `InteractiveMode.showSessionSelector` to intercept both the `/resume` command and the `app.session.resume` keybinding. Hijack mode is **on by default** — `/resume` opens the fast picker unless you opt out.
 
 - `/resume` opens the **fast** picker instead of the built-in one
 - `Ctrl+Shift+R` (or your mapped key) also opens the fast picker
 - `/fast-resume` is not registered (no duplicate command)
 - `pi -r` / `pi --resume` are **not** affected (they run before the interactive mode starts)
 
-### Enable
+### Disable
 
 Create or edit `~/.pi/agent/extensions/pi-fast-resume.json`:
 
 ```json
 {
-  "hijackResume": true
+  "hijackResume": false
 }
 ```
 
-Then reload with `/reload`. To disable, set `hijackResume` to `false` (or delete the key) and reload.
+Then reload with `/reload`. To re-enable, set `hijackResume` to `true` (or delete the key) and reload.
 
 ### How it works
 

@@ -11,8 +11,8 @@
  *   /fast-resume [query]   Open fast session picker (current project scope)
  *   Ctrl+Shift+F           Open fast session picker via shortcut
  *
- * Hijack mode (opt-in via ~/.pi/agent/extensions/pi-fast-resume.json):
- *   { "hijackResume": true }
+ * Hijack mode (on by default, opt-out via ~/.pi/agent/extensions/pi-fast-resume.json):
+ *   { "hijackResume": false }
  *
  *   When enabled, /resume and Ctrl+Shift+R open the fast picker instead.
  *   /fast-resume is not registered (no duplicate). pi -r is not affected.
@@ -92,7 +92,8 @@ import type { PickerScope } from "./src/picker-state.js";
 const HOME = homedir();
 
 // Config — read from ~/.pi/agent/extensions/pi-fast-resume.json
-// Example: { "hijackResume": true }
+// Example: { "hijackResume": false } to disable hijack
+// By default hijackResume is true — /resume opens the fast picker
 interface FastResumeConfig {
   hijackResume?: boolean;
 }
@@ -1034,7 +1035,7 @@ function uninstallResumeHijack(): void {
 
 export default function (pi: ExtensionAPI) {
   const config = readConfig();
-  const hijackResume = config.hijackResume === true;
+  const hijackResume = config.hijackResume !== false;
 
   if (hijackResume) {
     // Hijack /resume — replace the built-in session selector with our fast picker
