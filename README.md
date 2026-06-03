@@ -69,7 +69,7 @@ Tested with **1,771 sessions, 1.46 GB** of JSONL data on disk.
 **With `pi install`** (recommended):
 
 ```bash
-pi install git:github.com/monotykamary/pi-fast-resume
+pi install https://github.com/monotykamary/pi-fast-resume
 ```
 
 **Manual** — add to `~/.pi/agent/settings.json`:
