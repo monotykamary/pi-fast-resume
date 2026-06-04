@@ -1,6 +1,6 @@
 {
   "name": "pi-fast-resume",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Fast session picker for pi — reads headers + first messages from 16KB partial reads instead of full-file parsing",
   "type": "module",
   "author": "Tom X Nguyen",
