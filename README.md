@@ -107,13 +107,29 @@ Reload with `/reload` after any install method.
 
 ### Keyboard shortcut
 
-In hijack mode (default), the fast picker replaces `/resume` — so bind `app.session.resume` in `~/.pi/agent/keybindings.json`:
+There are two ways to bind a key to the fast resume picker:
+
+**Option 1: Rebind `app.session.resume`** (hijack mode only)
+
+In hijack mode (default), the fast picker replaces `/resume` — bind `app.session.resume` in `~/.pi/agent/keybindings.json`:
 
 ```json
 {
   "app.session.resume": "alt+u"
 }
 ```
+
+**Option 2: Standalone shortcut** (works regardless of hijack mode)
+
+Set the `shortcut` key in `~/.pi/agent/extensions/pi-fast-resume.json`:
+
+```json
+{
+  "shortcut": "ctrl+shift+f"
+}
+```
+
+This registers an independent shortcut that opens the fast picker without overriding the built-in `/resume`. Works in both hijack and non-hijack modes.
 
 See [keybindings.md](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/keybindings.md) for the key format and all available actions.
 
@@ -190,17 +206,25 @@ However, pi-fast-resume can **prototype-patch** `InteractiveMode.showSessionSele
 - `/fast-resume` is not registered (no duplicate command)
 - `pi -r` / `pi --resume` are **not** affected (they run before the interactive mode starts)
 
-### Disable
+### Config options
 
-Create or edit `~/.pi/agent/extensions/pi-fast-resume.json`:
+All options go in `~/.pi/agent/extensions/pi-fast-resume.json`:
+
+| Key | Type | Default | Description |
+| --- | ---- | ------- | ----------- |
+| `hijackResume` | `boolean` | `true` | When `true`, `/resume` and `app.session.resume` open the fast picker. Set `false` to use the built-in picker instead and keep `/fast-resume` as a separate command. |
+| `shortcut` | `string` | (none) | Register a standalone keybinding to open the fast picker. Works regardless of `hijackResume`. Example: `"ctrl+shift+f"` or `"alt+u"`.
+
+Example:
 
 ```json
 {
-  "hijackResume": false
+  "hijackResume": false,
+  "shortcut": "alt+u"
 }
 ```
 
-Then reload with `/reload`. To re-enable, set `hijackResume` to `true` (or delete the key) and reload.
+Reload with `/reload` after changing config.
 
 ### How it works
 
