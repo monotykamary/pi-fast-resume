@@ -107,9 +107,15 @@ Reload with `/reload` after any install method.
 
 ### Keyboard shortcut
 
-| Shortcut       | Action                      |
-| -------------- | --------------------------- |
-| `Ctrl+Shift+F` | Open the fast resume picker |
+In hijack mode (default), the fast picker replaces `/resume` — so bind `app.session.resume` in `~/.pi/agent/keybindings.json`:
+
+```json
+{
+  "app.session.resume": "alt+u"
+}
+```
+
+See [keybindings.md](https://github.com/earendil-works/pi-coding-agent/blob/main/docs/keybindings.md) for the key format and all available actions.
 
 ### Picker controls
 

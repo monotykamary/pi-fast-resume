@@ -9,9 +9,11 @@
  *
  * Usage:
  *   /fast-resume [query]   Open fast session picker (current project scope)
- *   Ctrl+Shift+F           Open fast session picker via shortcut
  *
- * Hijack mode (on by default, opt-out via ~/.pi/agent/extensions/pi-fast-resume.json):
+ * Config (~/.pi/agent/extensions/pi-fast-resume.json):
+ *   { "hijackResume": false }
+ *
+ * Hijack mode (on by default, opt-out via config):
  *   { "hijackResume": false }
  *
  *   When enabled, /resume and Ctrl+Shift+R open the fast picker instead.
@@ -54,7 +56,6 @@ import {
   type Component,
   getKeybindings,
   Input,
-  Key,
   Spacer,
   Text,
   truncateToWidth,
@@ -92,7 +93,7 @@ import type { PickerScope } from "./src/picker-state.js";
 const HOME = homedir();
 
 // Config — read from ~/.pi/agent/extensions/pi-fast-resume.json
-// Example: { "hijackResume": false } to disable hijack
+// Example: { "hijackResume": false }
 // By default hijackResume is true — /resume opens the fast picker
 interface FastResumeConfig {
   hijackResume?: boolean;
@@ -1056,12 +1057,12 @@ export default function (pi: ExtensionAPI) {
     });
   }
 
-  pi.registerShortcut(Key.ctrlShift("f"), {
-    description: hijackResume ? "Open fast session resume (also /resume)" : "Open fast session resume picker",
-    handler: async (ctx) => {
-      await showFastResumePicker(ctx as unknown as ExtensionCommandContext);
-    },
-  });
+  // No extension shortcut — pi's registerShortcut only provides
+  // ExtensionContext (no switchSession), so the handler can't switch
+  // sessions. Instead, rebind app.session.resume in keybindings.json:
+  //   { "app.session.resume": "alt+u" }
+  // In hijack mode (default), that key opens the fast picker.
+  // In non-hijack mode, type /fast-resume.
 
   // Clean up the prototype patch on session shutdown (reload, quit, session switch)
   pi.on("session_shutdown", () => {
