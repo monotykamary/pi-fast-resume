@@ -69,6 +69,12 @@ Tested with **1,771 sessions, 1.46 GB** of JSONL data on disk.
 **With `pi install`** (recommended):
 
 ```bash
+pi install npm:pi-fast-resume
+```
+
+Or install from GitHub:
+
+```bash
 pi install https://github.com/monotykamary/pi-fast-resume
 ```
 
