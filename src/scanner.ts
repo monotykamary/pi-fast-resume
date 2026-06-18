@@ -46,7 +46,7 @@ export function parseSessionFromBuffer(
 
   let header: { id: string; timestamp: string; cwd?: string; parentSession?: string } | null = null;
   let firstUserMsg = "";
-  let name = "";
+  let name: string | undefined;
   let msgCount = 0;
   let lastActivityTime: number | undefined;
 
@@ -60,8 +60,7 @@ export function parseSessionFromBuffer(
         continue;
       }
       if (entry.type === "session_info") {
-        const n = entry.name?.trim();
-        if (n) name = n;
+        name = entry.name?.trim() || undefined;
       }
       if (entry.type === "message") {
         msgCount++;
@@ -126,8 +125,8 @@ export function parseSessionFromBuffer(
     created: new Date(header.timestamp),
     modified,
     messageCount: msgCount,
-    firstMessage: firstUserMsg || "",
-    name: name || undefined,
+    firstMessage: firstUserMsg || "(no messages)",
+    name,
   };
 }
 

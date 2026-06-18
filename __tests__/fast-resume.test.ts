@@ -10,13 +10,6 @@ import {
   type SessionHeader,
 } from "../src/scanner.js";
 import {
-  createInitialState,
-  setScope,
-  setFilter,
-  moveSelection,
-  setSessions,
-} from "../src/picker-state.js";
-import {
   parseSearchQuery,
   matchSession,
   hasSessionName,
@@ -816,65 +809,47 @@ describe("buildTreePrefix", () => {
   });
 });
 
-describe("PickerState", () => {
-  it("creates initial state", () => {
-    const sessions = [makeSession(), makeSession()];
-    const state = createInitialState(sessions, 10, false);
-    expect(state.sessions).toHaveLength(2);
-    expect(state.totalCount).toBe(10);
-    expect(state.loadingDone).toBe(false);
+describe("session_info name handling", () => {
+  it("takes the latest non-empty session_info name", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "session_info", name: "First" }),
+      JSON.stringify({ type: "session_info", name: "Second" }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0);
+
+    expect(result).not.toBeNull();
+    expect(result!.name).toBe("Second");
   });
 
-  it("toggles scope", () => {
-    const state = createInitialState([], 0, true);
-    const toggled = setScope(state, "all");
-    expect(toggled.scope).toBe("all");
-    expect(toggled.filterQuery).toBe("");
-  });
+  it("clears the name when session_info name is empty", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "session_info", name: "Named" }),
+      JSON.stringify({ type: "session_info", name: "   " }),
+    ].join("\n");
 
-  it("filters sessions", () => {
-    const sessions = [
-      makeSession({ firstMessage: "Fix auth" }),
-      makeSession({ firstMessage: "Add feature" }),
-    ];
-    const state = createInitialState(sessions, 2, true);
-    const filtered = setFilter(state, "auth");
-    expect(filtered.filteredSessions).toHaveLength(1);
-    expect(filtered.filteredSessions[0]!.firstMessage).toBe("Fix auth");
-  });
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0);
 
-  it("moves selection up and down", () => {
-    const sessions = [makeSession(), makeSession(), makeSession()];
-    const state = createInitialState(sessions, 3, true);
-    const down = moveSelection(state, 1);
-    expect(down.selectedIndex).toBe(1);
-    const up = moveSelection(down, -1);
-    expect(up.selectedIndex).toBe(0);
+    expect(result).not.toBeNull();
+    expect(result!.name).toBeUndefined();
   });
+});
 
-  it("clamps selection at boundaries", () => {
-    const sessions = [makeSession()];
-    const state = createInitialState(sessions, 1, true);
-    const moved = moveSelection(state, -1);
-    expect(moved.selectedIndex).toBe(0);
-    const moved2 = moveSelection(state, 10);
-    expect(moved2.selectedIndex).toBe(0);
-  });
+describe("firstMessage fallback", () => {
+  it("defaults to (no messages) when there is no user message", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "message", message: { role: "assistant", content: "thinking..." } }),
+    ].join("\n");
 
-  it("updates sessions", () => {
-    const state = createInitialState([], 0, false);
-    const sessions = [makeSession(), makeSession()];
-    const updated = setSessions(state, sessions, true);
-    expect(updated.sessions).toHaveLength(2);
-    expect(updated.loadingDone).toBe(true);
-  });
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0);
 
-  it("resets filter when toggling scope", () => {
-    const sessions = [makeSession({ firstMessage: "test query" })];
-    let state = createInitialState(sessions, 1, true);
-    state = setFilter(state, "query");
-    expect(state.filterQuery).toBe("query");
-    state = setScope(state, "all");
-    expect(state.filterQuery).toBe("");
+    expect(result).not.toBeNull();
+    expect(result!.firstMessage).toBe("(no messages)");
   });
 });

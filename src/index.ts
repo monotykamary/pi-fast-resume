@@ -1,7 +1,5 @@
 export { parseSessionFromBuffer, loadSessionHeader, loadSessionHeaders, scanAllSessionDirs, scanSessionDir, sortByModified, sortByModifiedDesc, filterByCwd, matchQuery, canonicalizePath } from "./scanner.js";
 export type { SessionHeader, SessionFileMeta } from "./scanner.js";
-export { createInitialState, setScope, setSessions, setFilter, moveSelection } from "./picker-state.js";
-export type { PickerScope, PickerState } from "./picker-state.js";
 export {
   parseSearchQuery,
   matchSession,
@@ -18,6 +16,7 @@ export type {
   MatchResult,
   SortMode,
   NameFilter,
+  PickerScope,
   SessionTreeNode,
   FlatSessionNode,
 } from "./search.js";

@@ -73,6 +73,7 @@ import {
   loadSessionHeaders,
   sortByModified,
   sortByModifiedDesc,
+  filterByCwd,
   canonicalizePath,
   type SessionHeader,
   type SessionFileMeta,
@@ -88,8 +89,8 @@ import {
   type FlatSessionNode,
   type SortMode,
   type NameFilter,
+  type PickerScope,
 } from "./src/search.js";
-import type { PickerScope } from "./src/picker-state.js";
 
 const HOME = homedir();
 
@@ -120,6 +121,43 @@ export interface FastResumeResult {
 }
 
 type StatusMessage = { type: "info" | "error"; message: string };
+
+// Session loading helpers — mirror SessionManager.list / listAll behavior
+// while keeping partial reads.
+
+function loadCurrentSessionsImmediate(
+  cwd: string,
+  sessionDir: string | undefined,
+  usesDefaultSessionDir: boolean,
+): SessionHeader[] {
+  if (!sessionDir) return [];
+  const metas = sortByModifiedDesc(scanSessionDir(sessionDir));
+  let headers = loadSessionHeaders(metas);
+  if (!usesDefaultSessionDir) {
+    // Custom session dirs may contain sessions from multiple cwds; filter to
+    // the current one, matching SessionManager.list behavior.
+    headers = filterByCwd(headers, cwd);
+  }
+  return sortByModified(headers);
+}
+
+function loadAllSessionMetas(
+  sessionDir: string | undefined,
+  usesDefaultSessionDir: boolean,
+): SessionFileMeta[] {
+  if (usesDefaultSessionDir) {
+    return scanAllSessionDirs();
+  }
+  if (!sessionDir) return [];
+  return sortByModifiedDesc(scanSessionDir(sessionDir));
+}
+
+// ReadonlySessionManager doesn't declare usesDefaultSessionDir, but the
+// runtime SessionManager has it. Default to true so old pi versions behave
+// like the original default-dir-only fast-resume.
+function getUsesDefaultSessionDir(sessionManager: ExtensionCommandContext["sessionManager"]): boolean {
+  return (sessionManager as any).usesDefaultSessionDir?.() ?? true;
+}
 
 // Helpers
 
@@ -639,6 +677,10 @@ class FastResumePicker extends Container {
   private mode: "list" | "rename" = "list";
   private renameTargetPath: string | null = null;
 
+  private cwd: string;
+  private sessionDir: string | undefined;
+  private usesDefaultSessionDir: boolean;
+
   // Focusable — propagate to sessionList or renameInput
   private _focused = false;
   get focused() { return this._focused; }
@@ -668,18 +710,24 @@ class FastResumePicker extends Container {
   constructor(
     theme: Theme,
     currentCwd: string,
+    sessionDir: string | undefined,
+    usesDefaultSessionDir: boolean,
     currentSessionPath: string | undefined,
     initialCurrentSessions: SessionHeader[],
     allMetas: SessionFileMeta[],
     allSessions: SessionHeader[] | null,
     done: (result: FastResumeResult) => void,
     tuiRequestRender: () => void,
+    initialQuery?: string,
   ) {
     super();
     this.theme = theme;
     this.done = done;
     this.tuiRequestRender = tuiRequestRender;
     this.allMetas = allMetas;
+    this.cwd = currentCwd;
+    this.sessionDir = sessionDir;
+    this.usesDefaultSessionDir = usesDefaultSessionDir;
 
     // Create header
     this.header = new FastResumeHeader(theme, tuiRequestRender);
@@ -697,6 +745,12 @@ class FastResumePicker extends Container {
 
     // Set initial data into the list
     this.sessionList.setSessions(initialCurrentSessions, false);
+
+    // Seed an optional initial query from /fast-resume <query>
+    if (initialQuery !== undefined && initialQuery !== "") {
+      this.sessionList.searchInput.setValue(initialQuery);
+      this.sessionList.filterSessions(initialQuery);
+    }
 
     // Wire session list events
     this.sessionList.onSelect = (sessionPath) => {
@@ -819,12 +873,54 @@ class FastResumePicker extends Container {
     }
   }
 
+  private rescanCurrentScope(): SessionHeader[] {
+    if (!this.sessionDir) return [];
+    const metas = sortByModifiedDesc(scanSessionDir(this.sessionDir));
+    let headers = loadSessionHeaders(metas);
+    if (!this.usesDefaultSessionDir) {
+      headers = filterByCwd(headers, this.cwd);
+    }
+    return sortByModified(headers);
+  }
+
+  private rescanAllScope(): SessionHeader[] {
+    if (this.usesDefaultSessionDir) {
+      const metas = scanAllSessionDirs();
+      const headers = loadSessionHeaders(metas);
+      return sortByModified(headers);
+    }
+    if (!this.sessionDir) return [];
+    const metas = sortByModifiedDesc(scanSessionDir(this.sessionDir));
+    const headers = loadSessionHeaders(metas);
+    return sortByModified(headers);
+  }
+
   private async refreshSessionsAfterMutation(): Promise<void> {
-    // After delete/rename, the in-memory arrays are already updated (filtered above).
-    // Just re-apply them to the session list.
-    const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
-    const showCwd = this.scope === "all";
-    this.sessionList.setSessions(sessions, showCwd);
+    // Rescan from disk so renames, deletes, and newly created sessions are
+    // reflected in the list. This mirrors upstream's loadScope(scope, "refresh").
+    // Bump the sequence number first so any in-progress background all-load
+    // stops before it can overwrite the rescanned data.
+    this.allLoadSeq++;
+    try {
+      if (this.scope === "current") {
+        this.currentSessions = this.rescanCurrentScope();
+        this.sessionList.setSessions(this.currentSessions, false);
+      } else {
+        this.allLoading = true;
+        this.allSessions = this.rescanAllScope();
+        this.allLoading = false;
+        this.sessionList.setSessions(this.allSessions, true);
+      }
+      this.header.loading = false;
+      this.header.loadProgress = null;
+    } catch (err) {
+      this.currentLoading = false;
+      this.allLoading = false;
+      this.header.loading = false;
+      this.header.loadProgress = null;
+      const message = err instanceof Error ? err.message : String(err);
+      this.header.setStatusMessage({ type: "error", message: `Failed to refresh: ${message}` }, 4000);
+    }
   }
 
   private startAllLoadBackground(): void {
@@ -951,19 +1047,14 @@ async function showFastResumePicker(
 ): Promise<void> {
   const cwd = ctx.cwd;
   const sessionDir = ctx.sessionManager.getSessionDir();
+  const usesDefaultSessionDir = getUsesDefaultSessionDir(ctx.sessionManager);
 
   const t0 = Date.now();
 
-  // Phase 1: stat all session files
-  const currentMetas = sessionDir ? scanSessionDir(sessionDir) : [];
-  const allMetas = scanAllSessionDirs();
-
-  // Phase 2: quickly parse the first 30 for instant display
-  const INITIAL_BATCH = 30;
-  const sortedCurrent = sortByModifiedDesc(currentMetas);
-  const quickMetas = sortedCurrent.slice(0, INITIAL_BATCH);
-  const quickHeaders = loadSessionHeaders(quickMetas);
-  const currentSessions = sortByModified(quickHeaders);
+  // Load the current-scope sessions immediately, and collect metadata for the
+  // incremental "all" scope load that happens in the background.
+  const currentSessions = loadCurrentSessionsImmediate(cwd, sessionDir, usesDefaultSessionDir);
+  const allMetas = loadAllSessionMetas(sessionDir, usesDefaultSessionDir);
 
   const loadTime = Date.now() - t0;
 
@@ -977,12 +1068,15 @@ async function showFastResumePicker(
       const picker = new FastResumePicker(
         theme,
         cwd,
+        sessionDir,
+        usesDefaultSessionDir,
         ctx.sessionManager.getSessionFile(),
         currentSessions,
         allMetas,
         null, // allSessions not yet loaded — will load in background
         (result) => done(result),
         () => _tui.requestRender(),
+        initialQuery,
       );
 
       return picker;

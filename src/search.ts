@@ -12,6 +12,8 @@
 import { fuzzyMatch } from "@earendil-works/pi-tui";
 import { canonicalizePath, type SessionHeader } from "./scanner.js";
 
+export type PickerScope = "current" | "all";
+
 // Search query parsing
 
 export type SearchTokenKind = "fuzzy" | "phrase";
