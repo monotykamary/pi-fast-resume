@@ -23,6 +23,25 @@ export interface SessionFileMeta {
 
 const PARTIAL_READ_SIZE = 16_384;
 
+// Size of the trailing read used to recover session_info entries (session
+// names set via /rename or programmatically). These are appended at EOF by
+// SessionManager.appendSessionInfo, so for any session larger than the head
+// window the latest name lands past the partial read and would be invisible —
+// showing "(no messages)" for renamed large sessions. The tail read recovers
+// it, matching pi-core's getSessionName() semantics (latest session_info wins,
+// including explicit name clears).
+const TAIL_READ_SIZE = 8_192;
+
+// Result of scanning a file tail for session_info entries.
+//   found: false  → no session_info seen in the tail; fall back to the head's name.
+//   found: true   → a session_info was seen (later in file order than anything
+//                   in the head, since the tail starts past the head window);
+//                   name is undefined if that entry explicitly cleared the name.
+export interface TailSessionInfo {
+  found: boolean;
+  name?: string;
+}
+
 function extractTextFromContent(
   content: string | Array<{ type: string; text?: string }>,
 ): string {
@@ -39,6 +58,7 @@ export function parseSessionFromBuffer(
   filePath: string,
   mtimeMs: number,
   partial = false,
+  tailInfo?: TailSessionInfo,
 ): SessionHeader | null {
   const decoder = new StringDecoder("utf8");
   const text = decoder.write(buf.subarray(0, bytesRead)) + decoder.end();
@@ -117,6 +137,11 @@ export function parseSessionFromBuffer(
           : new Date(mtimeMs);
   }
 
+  // The tail scan (if any) sees session_info entries at EOF, which are later
+  // in file order than anything in the head window — so it wins over the
+  // head-derived name, including explicit clears (empty name → undefined).
+  const finalName = tailInfo?.found ? tailInfo.name : name;
+
   return {
     path: filePath,
     id: header.id,
@@ -126,8 +151,38 @@ export function parseSessionFromBuffer(
     modified,
     messageCount: msgCount,
     firstMessage: firstUserMsg || "(no messages)",
-    name,
+    name: finalName,
   };
+}
+
+// Scan a tail chunk (read from near EOF) for session_info entries and return
+// the latest name, matching pi-core's getSessionName() semantics: the latest
+// session_info in file order wins, including explicit clears (empty name).
+// The tail's first line may be a partial line cut off at the read-start
+// boundary — it is skipped naturally when JSON.parse fails.
+export function scanTailForSessionInfo(
+  buf: Buffer,
+  bytesRead: number,
+): TailSessionInfo {
+  const decoder = new StringDecoder("utf8");
+  const text = decoder.write(buf.subarray(0, bytesRead)) + decoder.end();
+  const lines = text.split("\n");
+  let found = false;
+  let name: string | undefined;
+  for (const line of lines) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed);
+      if (entry.type === "session_info") {
+        found = true;
+        name = entry.name?.trim() || undefined;
+      }
+    } catch {
+      // Partial line at tail boundary — skip
+    }
+  }
+  return { found, name };
 }
 
 const HOME = homedir();
@@ -221,7 +276,35 @@ export function loadSessionHeader(
     const readSize = Math.min(PARTIAL_READ_SIZE, meta.size);
     const buf = Buffer.alloc(readSize);
     const bytesRead = readSync(fd, buf, 0, readSize, 0);
-    return parseSessionFromBuffer(buf, bytesRead, meta.path, meta.mtimeMs, meta.size > PARTIAL_READ_SIZE);
+
+    // Recover the latest session name from EOF. session_info entries are
+    // appended at EOF by SessionManager.appendSessionInfo, so for any session
+    // larger than the head window they live past the 16KB read and would be
+    // invisible. The tail read covers `meta.size - PARTIAL_READ_SIZE` bytes
+    // (capped at TAIL_READ_SIZE), starting past the head window so it never
+    // overlaps. A failure here must not lose the whole header — fall back to
+    // head-only parsing by leaving tailInfo undefined.
+    let tailInfo: TailSessionInfo | undefined;
+    if (meta.size > PARTIAL_READ_SIZE) {
+      try {
+        const tailReadSize = Math.min(TAIL_READ_SIZE, meta.size - PARTIAL_READ_SIZE);
+        const tailBuf = Buffer.alloc(tailReadSize);
+        const tailOffset = meta.size - tailReadSize;
+        const tailBytesRead = readSync(fd, tailBuf, 0, tailReadSize, tailOffset);
+        tailInfo = scanTailForSessionInfo(tailBuf, tailBytesRead);
+      } catch {
+        // Tail read failed — fall back to head-only parse
+      }
+    }
+
+    return parseSessionFromBuffer(
+      buf,
+      bytesRead,
+      meta.path,
+      meta.mtimeMs,
+      meta.size > PARTIAL_READ_SIZE,
+      tailInfo,
+    );
   } catch {
     return null;
   } finally {

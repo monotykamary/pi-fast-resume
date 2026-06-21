@@ -7,7 +7,10 @@ import {
   canonicalizePath,
   scanAllSessionDirs,
   scanSessionDir,
+  scanTailForSessionInfo,
+  loadSessionHeader,
   type SessionHeader,
+  type TailSessionInfo,
 } from "../src/scanner.js";
 import {
   parseSearchQuery,
@@ -20,7 +23,7 @@ import {
   type FlatSessionNode,
   type SortMode,
 } from "../src/search.js";
-import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -851,5 +854,209 @@ describe("firstMessage fallback", () => {
 
     expect(result).not.toBeNull();
     expect(result!.firstMessage).toBe("(no messages)");
+  });
+});
+
+describe("parseSessionFromBuffer tailInfo (session name from EOF)", () => {
+  // tailInfo carries the latest session_info name found in a tail read of the
+  // file (past the 16KB head window). It mirrors pi-core's getSessionName():
+  // later-in-file session_info wins over the head's, including explicit clears.
+
+  it("uses tailInfo name when the head window has no session_info", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "message", message: { role: "assistant", content: "thinking..." } }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0, false, {
+      found: true,
+      name: "Renamed at EOF",
+    });
+
+    expect(result).not.toBeNull();
+    expect(result!.name).toBe("Renamed at EOF");
+  });
+
+  it("tailInfo wins over a stale head name (rename after head window)", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "session_info", name: "Old name in head" }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0, false, {
+      found: true,
+      name: "New name at EOF",
+    });
+
+    expect(result).not.toBeNull();
+    expect(result!.name).toBe("New name at EOF");
+  });
+
+  it("tailInfo explicit name clear wins over head's stale name", () => {
+    // pi-core getSessionName() treats an empty/whitespace name as an explicit
+    // clear; a tail-found clear must not fall back to the head's stale name.
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "session_info", name: "Old name in head" }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0, false, {
+      found: true,
+      name: undefined,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result!.name).toBeUndefined();
+  });
+
+  it("falls back to the head name when tail found no session_info", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "session_info", name: "Head name" }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0, false, {
+      found: false,
+    });
+
+    expect(result).not.toBeNull();
+    expect(result!.name).toBe("Head name");
+  });
+
+  it("omitting tailInfo preserves the head-only behavior", () => {
+    const jsonl = [
+      JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "session_info", name: "Head name" }),
+    ].join("\n");
+
+    const buf = Buffer.from(jsonl);
+    // No tailInfo arg — exactly the old call signature
+    const result = parseSessionFromBuffer(buf, buf.length, "/test/s.jsonl", 0);
+
+    expect(result).not.toBeNull();
+    expect(result!.name).toBe("Head name");
+  });
+});
+
+describe("scanTailForSessionInfo", () => {
+  it("finds the latest session_info name in a tail chunk", () => {
+    const tail = [
+      JSON.stringify({ type: "message", message: { role: "assistant", content: "x" } }),
+      JSON.stringify({ type: "session_info", name: "Old name" }),
+      JSON.stringify({ type: "session_info", name: "Latest name" }),
+    ].join("\n");
+    const buf = Buffer.from(tail);
+    const result = scanTailForSessionInfo(buf, buf.length);
+    expect(result.found).toBe(true);
+    expect(result.name).toBe("Latest name");
+  });
+
+  it("returns found:false when the tail has no session_info", () => {
+    const tail = [
+      JSON.stringify({ type: "message", message: { role: "assistant", content: "x" } }),
+      JSON.stringify({ type: "custom", customType: "x" }),
+    ].join("\n");
+    const buf = Buffer.from(tail);
+    const result = scanTailForSessionInfo(buf, buf.length);
+    expect(result.found).toBe(false);
+    expect(result.name).toBeUndefined();
+  });
+
+  it("treats an empty/whitespace name as an explicit clear", () => {
+    const tail = [
+      JSON.stringify({ type: "session_info", name: "Old name" }),
+      JSON.stringify({ type: "session_info", name: "   " }),
+    ].join("\n");
+    const buf = Buffer.from(tail);
+    const result = scanTailForSessionInfo(buf, buf.length);
+    expect(result.found).toBe(true);
+    expect(result.name).toBeUndefined();
+  });
+
+  it("skips a partial line at the read-start boundary", () => {
+    // First line is partial JSON (cut off at the tail read-start boundary);
+    // JSON.parse fails on it and it is skipped.
+    const tail = [
+      '{"type":"message","message":{"role":"assistant","content":"trunca',
+      JSON.stringify({ type: "session_info", name: "Found after partial" }),
+    ].join("\n");
+    const buf = Buffer.from(tail);
+    const result = scanTailForSessionInfo(buf, buf.length);
+    expect(result.found).toBe(true);
+    expect(result.name).toBe("Found after partial");
+  });
+});
+
+describe("loadSessionHeader tail read (session_info at EOF)", () => {
+  const testDir = join(tmpdir(), "pi-fast-resume-tail-test-" + process.pid);
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("recovers a session name appended at EOF past the 16KB head window", () => {
+    // Mirrors the reported bug: a large first user message (e.g. a <skill>
+    // injection) blows past the 16KB head read, and the rename's session_info
+    // sits at EOF beyond it. The tail read must recover the name.
+    mkdirSync(testDir, { recursive: true });
+    const filePath = join(testDir, "big.jsonl");
+    const oversized = "x".repeat(20_000); // forces the first user line past 16KB
+    const lines = [
+      JSON.stringify({ type: "session", id: "abc", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: oversized }] } }),
+      JSON.stringify({ type: "session_info", name: "Renamed at EOF" }),
+    ];
+    writeFileSync(filePath, lines.join("\n") + "\n");
+
+    const st = statSync(filePath);
+    const header = loadSessionHeader({ path: filePath, mtimeMs: st.mtimeMs, size: st.size });
+
+    expect(header).not.toBeNull();
+    expect(header!.name).toBe("Renamed at EOF");
+    // Fix 1 recovers the name; firstMessage is still "(no messages)" because
+    // the oversized first user line is truncated mid-JSON in the head window
+    // (that's Fix 2 territory, intentionally out of scope here).
+    expect(header!.firstMessage).toBe("(no messages)");
+    expect(st.size).toBeGreaterThan(16_384);
+  });
+
+  it("handles a session_info clear (empty name) at EOF past the head window", () => {
+    mkdirSync(testDir, { recursive: true });
+    const filePath = join(testDir, "cleared.jsonl");
+    const oversized = "y".repeat(20_000);
+    const lines = [
+      JSON.stringify({ type: "session", id: "abc", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: oversized }] } }),
+      JSON.stringify({ type: "session_info", name: "First rename" }),
+      JSON.stringify({ type: "session_info", name: "   " }), // explicit clear at EOF
+    ];
+    writeFileSync(filePath, lines.join("\n") + "\n");
+
+    const st = statSync(filePath);
+    const header = loadSessionHeader({ path: filePath, mtimeMs: st.mtimeMs, size: st.size });
+
+    expect(header).not.toBeNull();
+    expect(header!.name).toBeUndefined();
+  });
+
+  it("still reads the head name for small files (no tail read)", () => {
+    mkdirSync(testDir, { recursive: true });
+    const filePath = join(testDir, "small.jsonl");
+    const lines = [
+      JSON.stringify({ type: "session", id: "abc", timestamp: "2026-01-15T10:00:00Z" }),
+      JSON.stringify({ type: "session_info", name: "Small session name" }),
+    ];
+    writeFileSync(filePath, lines.join("\n") + "\n");
+
+    const st = statSync(filePath);
+    const header = loadSessionHeader({ path: filePath, mtimeMs: st.mtimeMs, size: st.size });
+
+    expect(header).not.toBeNull();
+    expect(header!.name).toBe("Small session name");
+    expect(st.size).toBeLessThanOrEqual(16_384);
   });
 });

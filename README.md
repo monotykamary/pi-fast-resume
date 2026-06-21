@@ -4,7 +4,7 @@
 
 **Instant session picker for [pi](https://github.com/earendil-works/pi-coding-agent)**
 
-_Reads 16KB per file instead of the full JSONL — first results in **6ms**._
+_Reads the head + tail of each file instead of the full JSONL — first results in **6ms**._
 
 [![pi extension](https://img.shields.io/badge/pi-extension-blueviolet)](https://github.com/earendil-works/pi-coding-agent)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
@@ -16,7 +16,7 @@ _Reads 16KB per file instead of the full JSONL — first results in **6ms**._
 > **`/resume` takes 5.6 seconds** when you have 1,700+ sessions.
 > pi-fast-resume's `/fast-resume` takes **6 milliseconds**.
 
-Same picker UI and keybindings as `/resume`. The difference is pi-fast-resume never reads beyond the first 16KB of any session file. Headers, names, first messages — they all live in the first few lines. Everything after that is full message history the picker never shows. Search matches against the first message only (see [Known Limitations](#known-limitations)).
+Same picker UI and keybindings as `/resume`. The difference is pi-fast-resume reads at most ~24KB of each file (a 16KB head + up to 8KB tail) instead of the full JSONL. The head carries the header and first user message; the tail recovers the latest session name, which pi appends at EOF on `/rename`. Everything between is full message history the picker never shows. Search matches against the first message only (see [Known Limitations](#known-limitations)).
 
 ```
 ──────────────────────────────────────────────────────────
@@ -180,7 +180,7 @@ stat() all .jsonl files ──────► sort by mtime ──────�
 
 1. **`stat()` all session files** — collect paths and mtimes (~100 ms for 1,700 files)
 2. **Sort by mtime descending** — most recent sessions first
-3. **Read first 16KB** of the top 30 files — extract header, name, first user message (~6 ms)
+3. **Read head (16KB) + tail (≤8KB)** of the top 30 files — extract header, first user message, and latest session name (~6 ms)
 4. **Show picker** — user can navigate, filter, and select immediately
 5. **Background load** — remaining sessions stream in batches of 50, non-blocking
 6. **Tab to switch scope** — filter to current project or show everything
