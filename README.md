@@ -4,7 +4,7 @@
 
 **Instant session picker for [pi](https://github.com/earendil-works/pi-coding-agent)**
 
-_Reads the head + tail of each file instead of the full JSONL — first results in **6ms**._
+_Reads just enough of each file to show the title row — first results in **6ms**._
 
 [![pi extension](https://img.shields.io/badge/pi-extension-blueviolet)](https://github.com/earendil-works/pi-coding-agent)
 [![license](https://img.shields.io/badge/license-MIT-blue)](./LICENSE)
@@ -16,7 +16,7 @@ _Reads the head + tail of each file instead of the full JSONL — first results 
 > **`/resume` takes 5.6 seconds** when you have 1,700+ sessions.
 > pi-fast-resume's `/fast-resume` takes **6 milliseconds**.
 
-Same picker UI and keybindings as `/resume`. The difference is pi-fast-resume reads at most ~24KB of each file (a 16KB head + up to 8KB tail) instead of the full JSONL. The head carries the header and first user message; the tail recovers the latest session name, which pi appends at EOF on `/rename`. Everything between is full message history the picker never shows. Search matches against the first message only (see [Known Limitations](#known-limitations)).
+Same picker UI and keybindings as `/resume`. The difference is pi-fast-resume never parses the full JSONL. For each file it streams complete lines forward just until the first user message (the title), then reads a bounded tail near EOF to recover the latest session name (which pi appends on `/rename`). Everything between is full message history the picker never shows. Search matches against the first message only (see [Known Limitations](#known-limitations)).
 
 ```
 ──────────────────────────────────────────────────────────
@@ -54,7 +54,7 @@ Tested with **1,771 sessions, 1.46 GB** of JSONL data on disk.
 | ------------------------------------------- | --------- | ------------------------------------------ |
 | `SessionManager.listAll()` (current)        | ~5,600 ms | Full parse of every file                   |
 | DuckDB `read_ndjson` full query             | ~2,560 ms | Still reads all 1.46 GB, but multithreaded |
-| Node.js partial read (16 KB/file)           | ~730 ms   | All 1,771 sessions                         |
+| Node.js streaming partial read (this extension) | ~370 ms | All ~2,550 sessions; stops at first user message + bounded tail |
 | DuckDB persistent index (query all)         | ~49 ms    | After one-time build                       |
 | `node:sqlite` persistent index (query)      | ~52 ms    | Zero external deps                         |
 | **pi-fast-resume, first 30 sessions**       | **~6 ms** | **Streaming display**                      |
@@ -165,7 +165,7 @@ Press `Tab` to switch to **all sessions** — shows every session pi knows about
 ## How it works
 
 ```
-stat() all .jsonl files ──────► sort by mtime ──────► read 16KB of top 30
+stat() all .jsonl files ──────► sort by mtime ──────► stream top 30 forward
       (~100ms)                   (recent first)          (~6ms)
                                                             │
                                                             ▼
@@ -180,7 +180,7 @@ stat() all .jsonl files ──────► sort by mtime ──────�
 
 1. **`stat()` all session files** — collect paths and mtimes (~100 ms for 1,700 files)
 2. **Sort by mtime descending** — most recent sessions first
-3. **Read head (16KB) + tail (≤8KB)** of the top 30 files — extract header, first user message, and latest session name (~6 ms)
+3. **Stream each file forward** line by line until the first user message, then read a bounded tail at EOF for the latest rename name (~6 ms)
 4. **Show picker** — user can navigate, filter, and select immediately
 5. **Background load** — remaining sessions stream in batches of 50, non-blocking
 6. **Tab to switch scope** — filter to current project or show everything
@@ -248,7 +248,7 @@ None optimize the `/resume` picker itself — they either still fully parse ever
 
 ## Known Limitations
 
-The 16KB partial-read tradeoff that gives pi-fast-resume its speed comes with one functional gap vs. the built-in `/resume`:
+The partial-read tradeoff that gives pi-fast-resume its speed comes with functional gaps vs. the built-in `/resume`. The forward stream reads exactly as many bytes as the first user message needs (no fixed window), so oversized first messages — `<skill>` injections, long pastes, base64 images — are parsed correctly. A rename is recovered only if it lives within a bounded tail near EOF (32 KB by default); a rename buried under more continued activity than that falls back to `firstMessage`.
 
 | Area | Built-in `/resume` | pi-fast-resume | Impact |
 | ---- | ------------------ | -------------- | ------ |

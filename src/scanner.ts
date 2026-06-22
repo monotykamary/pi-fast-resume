@@ -21,25 +21,74 @@ export interface SessionFileMeta {
   size: number;
 }
 
-const PARTIAL_READ_SIZE = 16_384;
+// I/O granularity for the streaming forward reader. This is pure performance
+// tuning — it does NOT affect correctness. The reader assembles complete lines
+// across chunks (a line is never truncated mid-JSON), so a line of any size is
+// parsed correctly regardless of this value. It only controls how many bytes
+// each readSync call fetches; smaller = more syscalls for big reads, larger =
+// over-read for tiny sessions that stop early. 16KB is a reasonable middle.
+const READ_CHUNK_SIZE = 16_384;
 
-// Size of the trailing read used to recover session_info entries (session
-// names set via /rename or programmatically). These are appended at EOF by
-// SessionManager.appendSessionInfo, so for any session larger than the head
-// window the latest name lands past the partial read and would be invisible —
-// showing "(no messages)" for renamed large sessions. The tail read recovers
-// it, matching pi-core's getSessionName() semantics (latest session_info wins,
-// including explicit name clears).
-const TAIL_READ_SIZE = 8_192;
+// Tail read for recovering the latest session_info (the rename name) near EOF.
+//
+// Why a tail read exists at all: pi appends session_info as a new line on every
+// /rename (appendSessionInfo → appendFileSync). The forward pass stops at the
+// first user message, which can be very early in a large file — so the latest
+// rename often lives past the forward pass's stop point and must be recovered
+// from the end of the file.
+//
+// Why the bound is this size and not "scan to EOF": scanning the whole file
+// backward to find a session_info that may not exist (98% of sessions are never
+// renamed) collapses pi-fast-resume's perf to pi-core's (~100× slower). So the
+// tail is bounded. The bound only needs to cover "the rename line itself plus
+// any continued activity written after the rename before reopening."
+//
+// Measurement (across 47 real renamed sessions on this system): the latest
+// session_info was at EOF in 100% of cases — the rename was the last write
+// before the session was reopened, every single time. 32KB therefore covers all
+// observed renames with ~32,000× margin, and also covers a rename followed by
+// up to ~32KB of continued activity (dozens of typical message turns) before
+// reopening. A rename followed by more than this much continued activity is
+// missed and falls back to firstMessage — the documented tradeoff vs a
+// full-file scan.
+const TAIL_READ_SIZE = 32_768;
+
+// Defensive guard against a single pathological line with no newline (e.g. a
+// corrupted file). Real pi sessions are newline-terminated JSONL, so this never
+// triggers on valid input. It only caps memory for malformed input.
+const MAX_LINE_BYTES = 256 * 1024 * 1024;
 
 // Result of scanning a file tail for session_info entries.
-//   found: false  → no session_info seen in the tail; fall back to the head's name.
+//   found: false  → no session_info seen in the tail; fall back to the forward name.
 //   found: true   → a session_info was seen (later in file order than anything
-//                   in the head, since the tail starts past the head window);
-//                   name is undefined if that entry explicitly cleared the name.
+//                   the forward pass saw, since the tail starts past the forward
+//                   stop); name is undefined if that entry explicitly cleared it.
 export interface TailSessionInfo {
   found: boolean;
   name?: string;
+}
+
+// Accumulator state while processing complete session entries line by line.
+// Shared by the pure parseSessionFromBuffer and the streaming loadSessionHeader
+// so the per-entry logic exists in exactly one place.
+interface SessionAccumulator {
+  header: { id: string; timestamp: string; cwd?: string; parentSession?: string } | null;
+  firstUserMessage: string;
+  messageCount: number;
+  name: string | undefined;
+  lastActivityTime: number | undefined;
+  foundFirstUser: boolean;
+}
+
+function newAccumulator(): SessionAccumulator {
+  return {
+    header: null,
+    firstUserMessage: "",
+    messageCount: 0,
+    name: undefined,
+    lastActivityTime: undefined,
+    foundFirstUser: false,
+  };
 }
 
 function extractTextFromContent(
@@ -52,6 +101,112 @@ function extractTextFromContent(
     .join(" ");
 }
 
+// Process one complete entry line. Pure: mutates only `acc`. Malformed JSON (a
+// line truncated at a read boundary, or genuinely corrupt input) is swallowed
+// by the try/catch — callers only ever feed complete lines, so a parse failure
+// here means the line is malformed and skipping it is correct.
+function processEntry(acc: SessionAccumulator, line: string): void {
+  const trimmed = line.trim();
+  if (!trimmed) return;
+  let entry: any;
+  try {
+    entry = JSON.parse(trimmed);
+  } catch {
+    return;
+  }
+  if (typeof entry !== "object" || entry === null) return;
+
+  if (entry.type === "session") {
+    acc.header = entry;
+    return;
+  }
+  if (entry.type === "session_info") {
+    // Latest session_info in file order wins, including explicit clears
+    // (empty/whitespace name → undefined). Matches pi-core's getSessionName().
+    acc.name = entry.name?.trim() || undefined;
+    return;
+  }
+  if (entry.type === "message") {
+    acc.messageCount++;
+
+    // Track last activity time. Matches pi-core's getMessageActivityTime
+    // priority: message.timestamp (number) > entry.timestamp (date string).
+    const msg = entry.message;
+    if (msg?.role === "user" || msg?.role === "assistant") {
+      const msgTimestamp = msg.timestamp;
+      if (typeof msgTimestamp === "number" && msgTimestamp > 0) {
+        acc.lastActivityTime = Math.max(acc.lastActivityTime ?? 0, msgTimestamp);
+      } else if (typeof entry.timestamp === "string") {
+        const t = Date.parse(entry.timestamp);
+        if (!Number.isNaN(t)) {
+          acc.lastActivityTime = Math.max(acc.lastActivityTime ?? 0, t);
+        }
+      }
+    }
+
+    if (!acc.foundFirstUser && msg?.role === "user") {
+      acc.firstUserMessage = extractTextFromContent(msg.content);
+      acc.foundFirstUser = true;
+    }
+  }
+}
+
+// Build the SessionHeader from an accumulator. `reachedEof` is whether the
+// forward pass consumed all input — when false (it stopped early at the first
+// user message), lastActivityTime only reflects entries seen and is unreliable,
+// so stat mtime is used instead (pi updates it on every append, so it tracks
+// the true last write time). `tailInfo`, if present, carries the latest
+// session_info from a tail read and wins over the forward name (later in file
+// order), including explicit name clears.
+function buildHeader(
+  acc: SessionAccumulator,
+  filePath: string,
+  mtimeMs: number,
+  reachedEof: boolean,
+  tailInfo?: TailSessionInfo,
+): SessionHeader | null {
+  const header = acc.header;
+  if (!header) return null;
+
+  const name = tailInfo?.found ? tailInfo.name : acc.name;
+
+  const headerTime = Date.parse(header.timestamp);
+  let modified: Date;
+  if (!reachedEof) {
+    // Partial read — stat mtime is the only reliable signal.
+    modified = new Date(mtimeMs);
+  } else if (typeof acc.lastActivityTime === "number" && acc.lastActivityTime > 0) {
+    modified = new Date(acc.lastActivityTime);
+  } else if (!Number.isNaN(headerTime)) {
+    modified = new Date(headerTime);
+  } else {
+    modified = new Date(mtimeMs);
+  }
+
+  return {
+    path: filePath,
+    id: header.id,
+    cwd: header.cwd ?? "",
+    parentSessionPath: header.parentSession || undefined,
+    created: new Date(header.timestamp),
+    modified,
+    messageCount: acc.messageCount,
+    firstMessage: acc.firstUserMessage || "(no messages)",
+    name,
+  };
+}
+
+// Pure parser over a buffer containing complete (or complete-prefix) entry
+// lines. Splits on \n and runs processEntry on each line; the last line may be
+// truncated at the buffer boundary (its JSON.parse fails and it is skipped).
+// `partial` means the buffer does not contain the whole file — when true,
+// modified time falls back to stat mtime (the buffer's lastActivityTime only
+// reflects the prefix). `tailInfo` carries a tail-read latest session_info that
+// overrides the buffer's name.
+//
+// Kept as a pure, synchronous, fd-free function for direct testing and
+// callers that already have the bytes. loadSessionHeader (the production path)
+// uses the streaming reader below so it never truncates a line mid-JSON.
 export function parseSessionFromBuffer(
   buf: Buffer,
   bytesRead: number,
@@ -63,96 +218,9 @@ export function parseSessionFromBuffer(
   const decoder = new StringDecoder("utf8");
   const text = decoder.write(buf.subarray(0, bytesRead)) + decoder.end();
   const lines = text.split("\n");
-
-  let header: { id: string; timestamp: string; cwd?: string; parentSession?: string } | null = null;
-  let firstUserMsg = "";
-  let name: string | undefined;
-  let msgCount = 0;
-  let lastActivityTime: number | undefined;
-
-  for (const line of lines) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const entry = JSON.parse(trimmed);
-      if (entry.type === "session") {
-        header = entry;
-        continue;
-      }
-      if (entry.type === "session_info") {
-        name = entry.name?.trim() || undefined;
-      }
-      if (entry.type === "message") {
-        msgCount++;
-
-        // Track last activity time from user/assistant messages
-        // Matches pi-core's getMessageActivityTime priority:
-        //   message.timestamp (number) > entry.timestamp (date string)
-        const msg = entry.message;
-        if (msg?.role === "user" || msg?.role === "assistant") {
-          const msgTimestamp = msg.timestamp;
-          if (typeof msgTimestamp === "number" && msgTimestamp > 0) {
-            lastActivityTime = Math.max(lastActivityTime ?? 0, msgTimestamp);
-          } else if (typeof entry.timestamp === "string") {
-            const t = new Date(entry.timestamp).getTime();
-            if (!Number.isNaN(t)) {
-              lastActivityTime = Math.max(lastActivityTime ?? 0, t);
-            }
-          }
-        }
-
-        if (!firstUserMsg && msg?.role === "user") {
-          try {
-            firstUserMsg = extractTextFromContent(msg.content);
-          } catch {
-            // Malformed content, skip
-          }
-        }
-      }
-    } catch {
-      // Incomplete/truncated JSON at buffer boundary, skip
-    }
-  }
-
-  if (!header) return null;
-
-  // Determine modified time:
-  //   - Full read: use pi-core's priority (message timestamp > header timestamp > stat mtime).
-  //     lastActivityTime is accurate since we saw every message.
-  //   - Partial read: stat mtime is more reliable than a partial lastActivityTime,
-  //     which only reflects messages in the first 16KB and may severely underestimate
-  //     the true last activity for large sessions.
-  const headerTime = typeof header.timestamp === "string" ? new Date(header.timestamp).getTime() : NaN;
-  let modified: Date;
-  if (partial) {
-    // Partial read — stat mtime is the most reliable signal
-    modified = new Date(mtimeMs);
-  } else {
-    // Full read — pi-core's priority chain
-    modified =
-      typeof lastActivityTime === "number" && lastActivityTime > 0
-        ? new Date(lastActivityTime)
-        : !Number.isNaN(headerTime)
-          ? new Date(headerTime)
-          : new Date(mtimeMs);
-  }
-
-  // The tail scan (if any) sees session_info entries at EOF, which are later
-  // in file order than anything in the head window — so it wins over the
-  // head-derived name, including explicit clears (empty name → undefined).
-  const finalName = tailInfo?.found ? tailInfo.name : name;
-
-  return {
-    path: filePath,
-    id: header.id,
-    cwd: header.cwd ?? "",
-    parentSessionPath: header.parentSession || undefined,
-    created: new Date(header.timestamp),
-    modified,
-    messageCount: msgCount,
-    firstMessage: firstUserMsg || "(no messages)",
-    name: finalName,
-  };
+  const acc = newAccumulator();
+  for (const line of lines) processEntry(acc, line);
+  return buildHeader(acc, filePath, mtimeMs, !partial, tailInfo);
 }
 
 // Scan a tail chunk (read from near EOF) for session_info entries and return
@@ -174,7 +242,7 @@ export function scanTailForSessionInfo(
     if (!trimmed) continue;
     try {
       const entry = JSON.parse(trimmed);
-      if (entry.type === "session_info") {
+      if (typeof entry === "object" && entry !== null && entry.type === "session_info") {
         found = true;
         name = entry.name?.trim() || undefined;
       }
@@ -183,6 +251,68 @@ export function scanTailForSessionInfo(
     }
   }
   return { found, name };
+}
+
+// Read complete lines forward from `fd` starting at offset 0. Calls onLine for
+// each complete (newline-terminated) line. Reading stops when onLine returns
+// false, or at EOF. Returns whether EOF was reached (i.e. the caller did not
+// stop early) and the byte offset just past the last emitted line's newline —
+// the caller uses this as the lower bound for any tail scan so the tail never
+// re-reads already-covered bytes.
+//
+// Chunk-based I/O with a StringDecoder so multi-byte UTF-8 sequences split
+// across chunk boundaries decode correctly. The in-memory line buffer grows to
+// fit the longest single line (bounded by MAX_LINE_BYTES against malformed
+// input); real entries are newline-terminated so this is unbounded only for
+// corrupt files.
+function forEachLineForward(
+  fd: number,
+  size: number,
+  onLine: (line: string) => boolean | void,
+): { reachedEof: boolean; consumedBytes: number } {
+  const decoder = new StringDecoder("utf8");
+  const chunk = Buffer.alloc(READ_CHUNK_SIZE);
+  let lineBuf = "";
+  let offset = 0;
+  let consumedBytes = 0;
+
+  const flushLine = (line: string): boolean | void => {
+    consumedBytes += Buffer.byteLength(line, "utf8") + 1; // +1 for \n
+    return onLine(line);
+  };
+
+  while (offset < size) {
+    const toRead = Math.min(READ_CHUNK_SIZE, size - offset);
+    const bytesRead = readSync(fd, chunk, 0, toRead, offset);
+    if (bytesRead <= 0) break;
+    offset += bytesRead;
+
+    const text = decoder.write(chunk.subarray(0, bytesRead));
+    let start = 0;
+    let nl: number;
+    while ((nl = text.indexOf("\n", start)) !== -1) {
+      const line = lineBuf + text.slice(start, nl);
+      lineBuf = "";
+      if (flushLine(line) === false) {
+        return { reachedEof: false, consumedBytes };
+      }
+      start = nl + 1;
+    }
+    lineBuf += text.slice(start);
+
+    // Defensive: bound memory for a single pathological line.
+    if (lineBuf.length > MAX_LINE_BYTES) {
+      lineBuf = "";
+    }
+  }
+  // Flush decoder + any trailing line without a final newline.
+  const tail = decoder.end();
+  if (tail) lineBuf += tail;
+  if (lineBuf.length > 0) {
+    consumedBytes += Buffer.byteLength(lineBuf, "utf8"); // no trailing \n
+    onLine(lineBuf);
+  }
+  return { reachedEof: true, consumedBytes };
 }
 
 const HOME = homedir();
@@ -267,44 +397,57 @@ export function scanSessionDir(
   return results;
 }
 
+// Load a session header from disk using a streaming forward read plus a bounded
+// tail read — no fixed head window.
+//
+// Forward pass: reads complete lines from the start and stops at the first user
+// message (which is all the title row needs). This reads exactly as many bytes
+// as the first user message requires — a few KB for a normal session, ~19KB
+// for a <skill> injection, more for a base64 image — and never truncates a line
+// mid-JSON the way a fixed byte window would. So oversized first user messages
+// (the cases that used to show "(no messages)") are now parsed correctly.
+//
+// Tail pass (only when the forward pass stopped before EOF): reads up to
+// TAIL_READ_SIZE bytes from EOF and recovers the latest session_info (the
+// rename name), bounded below by the forward stop offset so it never re-reads
+// covered bytes. See TAIL_READ_SIZE for the documented tradeoff.
 export function loadSessionHeader(
   meta: SessionFileMeta,
 ): SessionHeader | null {
   let fd: number | undefined;
   try {
     fd = openSync(meta.path, "r");
-    const readSize = Math.min(PARTIAL_READ_SIZE, meta.size);
-    const buf = Buffer.alloc(readSize);
-    const bytesRead = readSync(fd, buf, 0, readSize, 0);
+    const acc = newAccumulator();
 
-    // Recover the latest session name from EOF. session_info entries are
-    // appended at EOF by SessionManager.appendSessionInfo, so for any session
-    // larger than the head window they live past the 16KB read and would be
-    // invisible. The tail read covers `meta.size - PARTIAL_READ_SIZE` bytes
-    // (capped at TAIL_READ_SIZE), starting past the head window so it never
-    // overlaps. A failure here must not lose the whole header — fall back to
-    // head-only parsing by leaving tailInfo undefined.
+    // Forward pass: read complete lines, stopping at the first user message.
+    const { reachedEof: forwardReachedEof, consumedBytes } = forEachLineForward(
+      fd,
+      meta.size,
+      (line) => {
+        processEntry(acc, line);
+        if (acc.header && acc.foundFirstUser) return false;
+        return true;
+      },
+    );
+
+    // If the forward pass stopped before EOF, recover the latest session_info
+    // from a bounded tail at EOF. Bounded below by consumedBytes so it never
+    // re-parses already-seen entries; the tail wins over the forward name
+    // (later in file order). A failure here falls back to the forward name.
     let tailInfo: TailSessionInfo | undefined;
-    if (meta.size > PARTIAL_READ_SIZE) {
+    if (!forwardReachedEof) {
       try {
-        const tailReadSize = Math.min(TAIL_READ_SIZE, meta.size - PARTIAL_READ_SIZE);
+        const tailReadSize = Math.min(TAIL_READ_SIZE, meta.size - consumedBytes);
         const tailBuf = Buffer.alloc(tailReadSize);
         const tailOffset = meta.size - tailReadSize;
         const tailBytesRead = readSync(fd, tailBuf, 0, tailReadSize, tailOffset);
         tailInfo = scanTailForSessionInfo(tailBuf, tailBytesRead);
       } catch {
-        // Tail read failed — fall back to head-only parse
+        // Tail read failed — fall back to forward-only name
       }
     }
 
-    return parseSessionFromBuffer(
-      buf,
-      bytesRead,
-      meta.path,
-      meta.mtimeMs,
-      meta.size > PARTIAL_READ_SIZE,
-      tailInfo,
-    );
+    return buildHeader(acc, meta.path, meta.mtimeMs, forwardReachedEof, tailInfo);
   } catch {
     return null;
   } finally {

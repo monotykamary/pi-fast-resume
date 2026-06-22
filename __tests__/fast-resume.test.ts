@@ -859,10 +859,11 @@ describe("firstMessage fallback", () => {
 
 describe("parseSessionFromBuffer tailInfo (session name from EOF)", () => {
   // tailInfo carries the latest session_info name found in a tail read of the
-  // file (past the 16KB head window). It mirrors pi-core's getSessionName():
-  // later-in-file session_info wins over the head's, including explicit clears.
+  // file (past the forward pass's stop point). It mirrors pi-core's
+  // getSessionName(): later-in-file session_info wins over the forward name,
+  // including explicit clears.
 
-  it("uses tailInfo name when the head window has no session_info", () => {
+  it("uses tailInfo name when the forward pass saw no session_info", () => {
     const jsonl = [
       JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
       JSON.stringify({ type: "message", message: { role: "assistant", content: "thinking..." } }),
@@ -878,7 +879,7 @@ describe("parseSessionFromBuffer tailInfo (session name from EOF)", () => {
     expect(result!.name).toBe("Renamed at EOF");
   });
 
-  it("tailInfo wins over a stale head name (rename after head window)", () => {
+  it("tailInfo wins over a stale forward-pass name (rename after the forward stop)", () => {
     const jsonl = [
       JSON.stringify({ type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z" }),
       JSON.stringify({ type: "session_info", name: "Old name in head" }),
@@ -998,13 +999,13 @@ describe("loadSessionHeader tail read (session_info at EOF)", () => {
     rmSync(testDir, { recursive: true, force: true });
   });
 
-  it("recovers a session name appended at EOF past the 16KB head window", () => {
+  it("recovers a session name appended at EOF past the forward pass's stop point", () => {
     // Mirrors the reported bug: a large first user message (e.g. a <skill>
-    // injection) blows past the 16KB head read, and the rename's session_info
-    // sits at EOF beyond it. The tail read must recover the name.
+    // injection) forces the forward past one read chunk, and the rename's
+    // session_info sits at EOF beyond it. The tail read must recover the name.
     mkdirSync(testDir, { recursive: true });
     const filePath = join(testDir, "big.jsonl");
-    const oversized = "x".repeat(20_000); // forces the first user line past 16KB
+    const oversized = "x".repeat(20_000); // forces the first user line past one read chunk
     const lines = [
       JSON.stringify({ type: "session", id: "abc", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" }),
       JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: oversized }] } }),
@@ -1017,14 +1018,16 @@ describe("loadSessionHeader tail read (session_info at EOF)", () => {
 
     expect(header).not.toBeNull();
     expect(header!.name).toBe("Renamed at EOF");
-    // Fix 1 recovers the name; firstMessage is still "(no messages)" because
-    // the oversized first user line is truncated mid-JSON in the head window
-    // (that's Fix 2 territory, intentionally out of scope here).
-    expect(header!.firstMessage).toBe("(no messages)");
+    // The streaming forward read now recovers the oversized first user message
+    // too — previously a fixed 16KB head window truncated it mid-JSON and it
+    // showed as "(no messages)". The line spans past one read chunk and is
+    // assembled across chunks before parsing.
+    expect(header!.firstMessage).toBe(oversized);
+    expect(header!.messageCount).toBe(1);
     expect(st.size).toBeGreaterThan(16_384);
   });
 
-  it("handles a session_info clear (empty name) at EOF past the head window", () => {
+  it("handles a session_info clear (empty name) at EOF past the forward stop", () => {
     mkdirSync(testDir, { recursive: true });
     const filePath = join(testDir, "cleared.jsonl");
     const oversized = "y".repeat(20_000);
@@ -1058,5 +1061,136 @@ describe("loadSessionHeader tail read (session_info at EOF)", () => {
     expect(header).not.toBeNull();
     expect(header!.name).toBe("Small session name");
     expect(st.size).toBeLessThanOrEqual(16_384);
+  });
+});
+
+describe("loadSessionHeader streaming forward read", () => {
+  // The forward pass reads complete lines and stops at the first user message.
+  // There is no fixed byte window — a first user message of any size is read in
+  // full (assembled across read chunks) and parsed correctly. This is the fix
+  // for oversized first user messages (<skill> injections, long pastes, base64
+  // images) that previously truncated mid-JSON and showed as "(no messages)".
+  const testDir = join(tmpdir(), "pi-fast-resume-stream-test-" + process.pid);
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  it("recovers an oversized first user message that spans multiple read chunks", () => {
+    mkdirSync(testDir, { recursive: true });
+    const filePath = join(testDir, "oversized.jsonl");
+    // 50KB user message — well past the 16KB read granularity, forcing the
+    // reader to assemble the line across at least 4 chunks before parsing.
+    const oversized = "a".repeat(50_000);
+    const lines = [
+      JSON.stringify({ type: "session", id: "big", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: oversized }] } }),
+    ];
+    writeFileSync(filePath, lines.join("\n") + "\n");
+
+    const st = statSync(filePath);
+    const header = loadSessionHeader({ path: filePath, mtimeMs: st.mtimeMs, size: st.size });
+
+    expect(header).not.toBeNull();
+    expect(header!.firstMessage).toBe(oversized);
+    expect(header!.messageCount).toBe(1);
+    expect(st.size).toBeGreaterThan(16_384);
+  });
+
+  it("decodes multi-byte content that straddles a read-chunk boundary", () => {
+    mkdirSync(testDir, { recursive: true });
+    const filePath = join(testDir, "multibyte.jsonl");
+    // A long multi-byte user message forces the reader to split a UTF-8
+    // sequence across chunk boundaries; the StringDecoder must reassemble it.
+    const msg = "あ".repeat(20_000); // 3 bytes/char → ~60KB, spans several chunks
+    const lines = [
+      JSON.stringify({ type: "session", id: "mb", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: msg }] } }),
+    ];
+    writeFileSync(filePath, lines.join("\n") + "\n");
+
+    const st = statSync(filePath);
+    const header = loadSessionHeader({ path: filePath, mtimeMs: st.mtimeMs, size: st.size });
+
+    expect(header).not.toBeNull();
+    expect(header!.firstMessage).toBe(msg);
+  });
+
+  it("stops forward at the first user message and uses stat mtime (partial)", () => {
+    // Forward stops at the first user message even when more bytes follow.
+    // Since it did not reach EOF, modified falls back to stat mtime.
+    mkdirSync(testDir, { recursive: true });
+    const filePath = join(testDir, "partial.jsonl");
+    const oldMsgTime = 1_000_000_000_000; // 2001 — clearly older than stat mtime
+    const lines = [
+      JSON.stringify({ type: "session", id: "p", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" }),
+      JSON.stringify({ type: "message", message: { role: "assistant", content: "thinking", timestamp: oldMsgTime } }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "first user", timestamp: oldMsgTime } }),
+      JSON.stringify({ type: "message", message: { role: "assistant", content: "reply", timestamp: oldMsgTime } }),
+    ];
+    writeFileSync(filePath, lines.join("\n") + "\n");
+
+    const st = statSync(filePath);
+    const header = loadSessionHeader({ path: filePath, mtimeMs: st.mtimeMs, size: st.size });
+
+    expect(header).not.toBeNull();
+    expect(header!.firstMessage).toBe("first user");
+    // messageCount reflects only the entries seen before the forward pass
+    // stopped at the first user message (here: 2 — the assistant + the user).
+    expect(header!.messageCount).toBe(2);
+    // Partial read → stat mtime (truncated to integer ms by Date), not the
+    // stale old message timestamps.
+    expect(header!.modified.getTime()).toBe(Math.floor(st.mtimeMs));
+  });
+
+  it("handles a <skill>-injection first user message (the reported case)", () => {
+    // Reproduces the neuralwatt/cdp session: a <skill> wrapper (~16KB) as the
+    // first user message, never renamed. Previously showed "(no messages)";
+    // now the full skill text is the displayed firstMessage, matching pi-core.
+    mkdirSync(testDir, { recursive: true });
+    const filePath = join(testDir, "skill.jsonl");
+    const skillBody = "# Skill body\nline 2\n".repeat(2_000); // ~36KB
+    const skillText = `<skill name="cdp" location="/x/SKILL.md">\n${skillBody}</skill>`;
+    const lines = [
+      JSON.stringify({ type: "session", id: "sk", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" }),
+      JSON.stringify({ type: "model_change", to: "m" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: [{ type: "text", text: skillText }] } }),
+    ];
+    writeFileSync(filePath, lines.join("\n") + "\n");
+
+    const st = statSync(filePath);
+    const header = loadSessionHeader({ path: filePath, mtimeMs: st.mtimeMs, size: st.size });
+
+    expect(header).not.toBeNull();
+    expect(header!.firstMessage).toBe(skillText);
+    expect(header!.name).toBeUndefined();
+  });
+
+  it("does not recover a session_info beyond the tail bound (documented tradeoff)", () => {
+    // The tail read covers up to TAIL_READ_SIZE bytes from EOF. A rename
+    // followed by more than that much continued activity is missed and falls
+    // back to firstMessage — the documented tradeoff vs scanning the whole file.
+    // This test pins that behavior so the tradeoff is explicit.
+    mkdirSync(testDir, { recursive: true });
+    const filePath = join(testDir, "deep-rename.jsonl");
+    const lines = [
+      JSON.stringify({ type: "session", id: "d", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" }),
+      JSON.stringify({ type: "message", message: { role: "user", content: "first" } }),
+      JSON.stringify({ type: "session_info", name: "Renamed then buried" }),
+    ];
+    // Append > 32KB of trailing activity so the rename is beyond the tail bound.
+    for (let i = 0; i < 2_000; i++) {
+      lines.push(JSON.stringify({ type: "message", message: { role: "assistant", content: `activity ${i} ` + "y".repeat(30) } }));
+    }
+    writeFileSync(filePath, lines.join("\n") + "\n");
+
+    const st = statSync(filePath);
+    const header = loadSessionHeader({ path: filePath, mtimeMs: st.mtimeMs, size: st.size });
+
+    expect(header).not.toBeNull();
+    expect(header!.firstMessage).toBe("first");
+    // The rename is buried under >32KB of trailing activity → not recovered.
+    expect(header!.name).toBeUndefined();
+    expect(st.size).toBeGreaterThan(32_768);
   });
 });

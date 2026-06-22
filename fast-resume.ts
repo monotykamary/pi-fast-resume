@@ -1,9 +1,10 @@
 /**
  * pi-fast-resume — Fast session picker for pi
  *
- * Reads only the first 16KB of each session file (header + first messages)
- * instead of parsing the entire JSONL. Shows results instantly with
- * incremental background loading.
+ * Reads only enough of each session file to render the title row — streaming
+ * forward line by line until the first user message, plus a bounded tail near
+ * EOF for the latest rename name — instead of parsing the entire JSONL. Shows
+ * results instantly with incremental background loading.
  *
  * Mirrors the exact TUI layout and keybindings of pi's built-in /resume.
  *
@@ -36,10 +37,10 @@
  *   exact phrase           "node cve"       case-insensitive substring
  *   regex                  re:<pattern>      RegExp search (case-insensitive)
  *
- * Note on search depth: pi-fast-resume only reads the first 16KB of each
- * session file, so search matches against id + name + firstMessage + cwd.
+ * Note on search depth: pi-fast-resume stops reading each file at the first
+ * user message, so search matches against id + name + firstMessage + cwd.
  * Upstream /resume matches against all messages (allMessagesText). This
- * tradeoff is by design — the 6ms load time depends on partial reads.
+ * tradeoff is by design — the fast load time depends on partial reads.
  */
 
 import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";

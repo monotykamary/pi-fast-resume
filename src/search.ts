@@ -38,10 +38,11 @@ function normalizeWhitespaceLower(text: string): string {
  * Build the searchable text for a session.
  *
  * IMPORTANT LIMITATION: pi-core's /resume builds `allMessagesText` from the
- * full file, so search matches against every message in the session. We only
- * read the first 16KB, so we search against `firstMessage` instead. This means
- * queries like `fix oauth` won't match a session where that phrase appears in
- * the 5th message but not the 1st. Name, id, and cwd matches are unaffected.
+ * full file, so search matches against every message in the session. We stop
+ * reading at the first user message, so we search against `firstMessage`
+ * instead. This means queries like `fix oauth` won't match a session where
+ * that phrase appears in the 5th message but not the 1st. Name, id, and cwd
+ * matches are unaffected.
  *
  * See README "Known Limitations" section for the user-facing explanation.
  */
