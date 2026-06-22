@@ -72,6 +72,8 @@ import {
   scanAllSessionDirs,
   scanSessionDir,
   loadSessionHeaders,
+  loadSessionHeadersForward,
+  resolveSessionName,
   sortByModified,
   sortByModifiedDesc,
   filterByCwd,
@@ -133,7 +135,7 @@ function loadCurrentSessionsImmediate(
 ): SessionHeader[] {
   if (!sessionDir) return [];
   const metas = sortByModifiedDesc(scanSessionDir(sessionDir));
-  let headers = loadSessionHeaders(metas);
+  let headers = loadSessionHeadersForward(metas);
   if (!usesDefaultSessionDir) {
     // Custom session dirs may contain sessions from multiple cwds; filter to
     // the current one, matching SessionManager.list behavior.
@@ -675,6 +677,17 @@ class FastResumePicker extends Container {
   private loadingAbort: AbortController | null = null;
   private allLoadSeq = 0;
 
+  // Deferred rename-name resolution. The picker displays rows immediately
+  // with forward-only headers (fast: ~80ms for 2.5k sessions); the latest rename
+  // name (which pi appends at EOF, past the forward stop) is resolved per file
+  // in the background and applied in-place, so a row's name pops in without
+  // blocking the initial render. See resolveSessionName in scanner.ts.
+  private metaByPath = new Map<string, SessionFileMeta>();
+  private nameResolveQueue: SessionFileMeta[] = [];
+  private nameResolveScheduled = false;
+  private nameResolveSeq = 0;
+  private nameResolvedPaths = new Set<string>();
+
   private mode: "list" | "rename" = "list";
   private renameTargetPath: string | null = null;
 
@@ -757,16 +770,19 @@ class FastResumePicker extends Container {
     this.sessionList.onSelect = (sessionPath) => {
       this.header.clearStatusTimeout();
       this.loadingAbort?.abort();
+      this.nameResolveSeq++; // cancel any pending name-resolution ticks
       this.done({ sessionPath, cancelled: false });
     };
     this.sessionList.onCancel = () => {
       this.header.clearStatusTimeout();
       this.loadingAbort?.abort();
+      this.nameResolveSeq++;
       this.done({ cancelled: true });
     };
     this.sessionList.onExit = () => {
       this.header.clearStatusTimeout();
       this.loadingAbort?.abort();
+      this.nameResolveSeq++;
       this.done({ cancelled: true });
     };
     this.sessionList.onToggleScope = () => this.toggleScope();
@@ -817,6 +833,17 @@ class FastResumePicker extends Container {
 
     // Build layout
     this.buildBaseLayout(this.sessionList);
+
+    // Build the path → meta lookup from allMetas (which is a superset of the
+    // current-scope metas both for the default and custom-dir cases), then
+    // enqueue the current-scope sessions for background rename-name resolution.
+    // Rows are already visible with the correct firstMessage; names populate
+    // in-place as their tails resolve.
+    for (const m of allMetas) this.metaByPath.set(m.path, m);
+    const currentMetas = initialCurrentSessions
+      .map((s) => this.metaByPath.get(s.path))
+      .filter((m): m is SessionFileMeta => !!m);
+    this.enqueueNameResolution(currentMetas);
 
     // Start loading current sessions (mark as loaded since we already have them)
     this.currentLoading = false;
@@ -957,7 +984,10 @@ class FastResumePicker extends Container {
 
       let headers: SessionHeader[];
       try {
-        headers = loadSessionHeaders(batch);
+        // Forward-only: the rename name will resolve in the background via
+        // resolveSessionName (enqueued below), so rows appear with the correct
+        // firstMessage immediately and names populate in-place.
+        headers = loadSessionHeadersForward(batch);
       } catch (err) {
         const message = err instanceof Error ? err.message : String(err);
         this.allLoading = false;
@@ -970,6 +1000,10 @@ class FastResumePicker extends Container {
       }
 
       allParsed.push(...headers);
+      // Enqueue this batch's metas for background rename-name resolution.
+      // Names will be applied in-place as they resolve; if the user is viewing
+      // "all" scope, newly-named rows also reflect in the active list.
+      this.enqueueNameResolution(batch);
 
       // If we're currently showing "all" scope, update progress
       if (this.scope === "all") {
@@ -984,6 +1018,76 @@ class FastResumePicker extends Container {
     };
 
     setImmediate(loadBatch);
+  }
+
+  // Enqueue session file metas for background rename-name resolution. Each
+  // path is resolved at most once (deduped via nameResolvedPaths); repeated
+  // enqueues for the same path are no-ops. Safe to call for the current-scope
+  // sessions at construction and for each batch of the all-scope background load.
+  private enqueueNameResolution(metas: SessionFileMeta[]): void {
+    for (const m of metas) {
+      if (this.nameResolvedPaths.has(m.path)) continue;
+      this.nameResolvedPaths.add(m.path);
+      this.nameResolveQueue.push(m);
+    }
+    this.scheduleNameResolution();
+  }
+
+  private scheduleNameResolution(): void {
+    if (this.nameResolveScheduled) return;
+    this.nameResolveScheduled = true;
+    setImmediate(() => this.drainNameResolution());
+  }
+
+  // Resolve one cooperative batch of rename names (up to 50 per tick), apply
+  // any found names in-place, and re-render once for the whole batch. Yields
+  // between batches so input stays responsive even while thousands of tail
+  // reads resolve. Aborts cleanly on select/cancel/exit via nameResolveSeq.
+  private drainNameResolution(): void {
+    this.nameResolveScheduled = false;
+    if (this.loadingAbort?.signal.aborted) return;
+    const seq = this.nameResolveSeq;
+    const BATCH = 50;
+    const batch = this.nameResolveQueue.splice(0, BATCH);
+    if (batch.length === 0) return;
+
+    let updatedAny = false;
+    for (const meta of batch) {
+      if (seq !== this.nameResolveSeq) return; // stale — picker exited/aborted
+      const result = resolveSessionName(meta);
+      if (result.found && this.applyNameUpdate(meta.path, result.name)) {
+        updatedAny = true;
+      }
+    }
+
+    if (updatedAny) {
+      const sessions = this.scope === "all" ? (this.allSessions ?? []) : (this.currentSessions ?? []);
+      const showCwd = this.scope === "all";
+      this.sessionList.setSessions(sessions, showCwd);
+      this.tuiRequestRender();
+    }
+
+    if (this.nameResolveQueue.length > 0) this.scheduleNameResolution();
+  }
+
+  // Apply a resolved name to the session with the given path in both the
+  // current- and all-scope caches. The same logical session may appear as
+  // distinct objects in the two caches, so both are updated. Returns whether a
+  // session was found and updated (so the caller can batch re-renders).
+  private applyNameUpdate(path: string, name: string | undefined): boolean {
+    let updated = false;
+    const updateArr = (arr: SessionHeader[] | null) => {
+      if (!arr) return;
+      for (const s of arr) {
+        if (s.path === path) {
+          s.name = name;
+          updated = true;
+        }
+      }
+    };
+    updateArr(this.currentSessions);
+    updateArr(this.allSessions);
+    return updated;
   }
 
   private toggleScope(): void {

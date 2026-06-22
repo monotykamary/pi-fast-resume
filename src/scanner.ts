@@ -397,20 +397,72 @@ export function scanSessionDir(
   return results;
 }
 
-// Load a session header from disk using a streaming forward read plus a bounded
-// tail read — no fixed head window.
+// Forward-only load: reads complete lines from the start and stops at the
+// first user message (which is all the title row needs). This reads exactly as
+// many bytes as the first user message requires — a few KB for a normal
+// session, ~19KB for a <skill> injection, more for a base64 image — and never
+// truncates a line mid-JSON the way a fixed byte window would. So oversized
+// first user messages (the cases that used to show "(no messages)") are parsed
+// correctly.
 //
-// Forward pass: reads complete lines from the start and stops at the first user
-// message (which is all the title row needs). This reads exactly as many bytes
-// as the first user message requires — a few KB for a normal session, ~19KB
-// for a <skill> injection, more for a base64 image — and never truncates a line
-// mid-JSON the way a fixed byte window would. So oversized first user messages
-// (the cases that used to show "(no messages)") are now parsed correctly.
+// No tail read — the returned header's name reflects only session_info entries
+// seen within the forward window. For sessions whose latest rename lives past
+// the forward stop point (the common case for renamed large sessions), pair
+// this with resolveSessionName() run in the background; the name then populates
+// in-place without blocking the picker's initial render.
+export function loadSessionHeaderForward(
+  meta: SessionFileMeta,
+): SessionHeader | null {
+  let fd: number | undefined;
+  try {
+    fd = openSync(meta.path, "r");
+    const acc = newAccumulator();
+    const { reachedEof } = forEachLineForward(fd, meta.size, (line) => {
+      processEntry(acc, line);
+      if (acc.header && acc.foundFirstUser) return false;
+      return true;
+    });
+    return buildHeader(acc, meta.path, meta.mtimeMs, reachedEof);
+  } catch {
+    return null;
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+// Resolve the latest session_info (the rename name) from a bounded tail at EOF,
+// independent of any forward pass. Returns found:false when no session_info
+// lives in the tail region (keep whatever name the forward pass produced);
+// found:true means a session_info was seen — its name (or explicit clear)
+// overrides the forward name (it is later in file order).
 //
-// Tail pass (only when the forward pass stopped before EOF): reads up to
-// TAIL_READ_SIZE bytes from EOF and recovers the latest session_info (the
-// rename name), bounded below by the forward stop offset so it never re-reads
-// covered bytes. See TAIL_READ_SIZE for the documented tradeoff.
+// This is the deferred half of loadSessionHeader, exposed so callers can show
+// a row immediately with the forward name and resolve the rename name in the
+// background. Reading up to TAIL_READ_SIZE bytes from EOF may overlap the
+// forward region for small files; that is a redundant re-read of a small range
+// (no correctness impact — the latest session_info wins either way).
+export function resolveSessionName(meta: SessionFileMeta): TailSessionInfo {
+  if (meta.size <= 0) return { found: false };
+  let fd: number | undefined;
+  try {
+    fd = openSync(meta.path, "r");
+    const tailReadSize = Math.min(TAIL_READ_SIZE, meta.size);
+    const tailBuf = Buffer.alloc(tailReadSize);
+    const tailOffset = meta.size - tailReadSize;
+    const tailBytesRead = readSync(fd, tailBuf, 0, tailReadSize, tailOffset);
+    return scanTailForSessionInfo(tailBuf, tailBytesRead);
+  } catch {
+    return { found: false };
+  } finally {
+    if (fd !== undefined) closeSync(fd);
+  }
+}
+
+// Load a session header using a streaming forward read plus a bounded tail read
+// — forward + tail in one shared fd. Equivalent to loadSessionHeaderForward
+// followed by resolveSessionName, but bounds the tail below by the forward stop
+// offset so it never re-reads already-covered bytes. Use this when the full
+// header (including rename name) is needed synchronously.
 export function loadSessionHeader(
   meta: SessionFileMeta,
 ): SessionHeader | null {
@@ -461,6 +513,20 @@ export function loadSessionHeaders(
   const results: SessionHeader[] = [];
   for (const meta of metas) {
     const header = loadSessionHeader(meta);
+    if (header) results.push(header);
+  }
+  return results;
+}
+
+// Forward-only batch load — see loadSessionHeaderForward. Use for the picker's
+// immediate display path: rows appear instantly with the correct firstMessage,
+// and rename names resolve in the background via resolveSessionName().
+export function loadSessionHeadersForward(
+  metas: SessionFileMeta[],
+): SessionHeader[] {
+  const results: SessionHeader[] = [];
+  for (const meta of metas) {
+    const header = loadSessionHeaderForward(meta);
     if (header) results.push(header);
   }
   return results;

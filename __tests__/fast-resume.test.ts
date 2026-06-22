@@ -9,6 +9,10 @@ import {
   scanSessionDir,
   scanTailForSessionInfo,
   loadSessionHeader,
+  loadSessionHeaders,
+  loadSessionHeaderForward,
+  loadSessionHeadersForward,
+  resolveSessionName,
   type SessionHeader,
   type TailSessionInfo,
 } from "../src/scanner.js";
@@ -1192,5 +1196,152 @@ describe("loadSessionHeader streaming forward read", () => {
     // The rename is buried under >32KB of trailing activity → not recovered.
     expect(header!.name).toBeUndefined();
     expect(st.size).toBeGreaterThan(32_768);
+  });
+});
+
+describe("deferred name resolution (forward-only + resolveSessionName)", () => {
+  // The picker displays rows immediately with a forward-only header (no tail
+  // read), then resolves rename names in the background via resolveSessionName.
+  // For any session, forward + resolve must equal the combined loadSessionHeader
+  // — that equivalence is the contract the picker relies on.
+  const testDir = join(tmpdir(), "pi-fast-resume-deferred-" + process.pid);
+
+  afterEach(() => {
+    rmSync(testDir, { recursive: true, force: true });
+  });
+
+  function writeSession(file: string, lines: unknown[]) {
+    mkdirSync(testDir, { recursive: true });
+    const p = join(testDir, file);
+    writeFileSync(p, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    const st = statSync(p);
+    return { path: p, mtimeMs: st.mtimeMs, size: st.size };
+  }
+
+  it("forward-only header omits a rename that lives past the forward stop", () => {
+    // First user message is oversized, so the forward pass stops well before
+    // the session_info at EOF. Forward-only must NOT see the rename name.
+    const oversized = "x".repeat(20_000);
+    const meta = writeSession("renamed.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: [{ type: "text", text: oversized }] } },
+      { type: "session_info", name: "Renamed at EOF" },
+    ]);
+
+    const fwd = loadSessionHeaderForward(meta);
+    expect(fwd).not.toBeNull();
+    expect(fwd!.firstMessage).toBe(oversized);
+    // No tail read → the rename (past the forward stop) is not yet visible.
+    expect(fwd!.name).toBeUndefined();
+  });
+
+  it("resolveSessionName recovers the rename from the tail", () => {
+    const oversized = "x".repeat(20_000);
+    const meta = writeSession("renamed.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: [{ type: "text", text: oversized }] } },
+      { type: "session_info", name: "Renamed at EOF" },
+    ]);
+
+    const tail = resolveSessionName(meta);
+    expect(tail.found).toBe(true);
+    expect(tail.name).toBe("Renamed at EOF");
+  });
+
+  it("forward + resolveSessionName equals the combined loadSessionHeader", () => {
+    // The core contract for the deferred model: applying the tail result to
+    // the forward-only header yields exactly what the combined load produces.
+    const oversized = "x".repeat(20_000);
+    const meta = writeSession("equiv.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: [{ type: "text", text: oversized }] } },
+      { type: "session_info", name: "First rename" },
+      { type: "message", message: { role: "assistant", content: "work" } },
+      { type: "session_info", name: "Latest rename" },
+    ]);
+
+    const combined = loadSessionHeader(meta);
+    const fwd = loadSessionHeaderForward(meta);
+    const tail = resolveSessionName(meta);
+    const resolvedName = tail.found ? tail.name : fwd?.name;
+
+    expect(combined).not.toBeNull();
+    expect(fwd).not.toBeNull();
+    expect(resolvedName).toBe(combined!.name); // "Latest rename"
+    expect(resolvedName).toBe("Latest rename");
+  });
+
+  it("resolveSessionName treats an empty name as an explicit clear (found:true)", () => {
+    const oversized = "x".repeat(20_000);
+    const meta = writeSession("cleared.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: [{ type: "text", text: oversized }] } },
+      { type: "session_info", name: "Named" },
+      { type: "session_info", name: "   " }, // explicit clear at EOF
+    ]);
+
+    const tail = resolveSessionName(meta);
+    // found:true signals the picker to override the forward name — with
+    // undefined (the clear), not fall back to it.
+    expect(tail.found).toBe(true);
+    expect(tail.name).toBeUndefined();
+  });
+
+  it("resolveSessionName returns found:false when no session_info is in the tail", () => {
+    // Un-named session: no session_info anywhere → the picker keeps the
+    // forward-only name (undefined) and shows firstMessage. No override.
+    const oversized = "x".repeat(20_000);
+    const meta = writeSession("unnamed.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: [{ type: "text", text: oversized }] } },
+      { type: "message", message: { role: "assistant", content: "reply" } },
+    ]);
+
+    const tail = resolveSessionName(meta);
+    expect(tail.found).toBe(false);
+    expect(tail.name).toBeUndefined();
+  });
+
+  it("resolveSessionName on a missing file returns found:false (no throw)", () => {
+    const meta = { path: join(testDir, "does-not-exist.jsonl"), mtimeMs: 0, size: 0 };
+    const tail = resolveSessionName(meta);
+    expect(tail.found).toBe(false);
+    expect(tail.name).toBeUndefined();
+  });
+
+  it("loadSessionHeadersForward mirrors non-name fields; resolveSessionName recovers names", () => {
+    // The batch forward-only path must produce headers whose id/cwd/firstMessage/
+    // modified/parentSessionPath match a combined load. `name` may differ when
+    // the latest session_info lives past the forward stop (the common case —
+    // the forward pass stops at the first user message, before any rename at
+    // EOF); resolveSessionName then recovers it. This guards the all-scope
+    // background batch load's forward-only + deferred-resolve contract.
+    const common = [
+      { type: "session", id: "x", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: "first" } },
+    ];
+    const m1 = writeSession("s1.jsonl", [...common, { type: "session_info", name: "N1" }]);
+    const m2 = writeSession("s2.jsonl", [...common, { type: "session_info", name: "N2" }]);
+
+    const fwd = loadSessionHeadersForward([m1, m2]);
+    const full = loadSessionHeaders([m1, m2]);
+    expect(fwd).toHaveLength(2);
+    expect(full).toHaveLength(2);
+
+    for (const f of fwd) {
+      const c = full.find((h) => h.path === f.path)!;
+      // Non-name fields are identical between forward-only and combined.
+      expect(f.id).toBe(c.id);
+      expect(f.cwd).toBe(c.cwd);
+      expect(f.firstMessage).toBe(c.firstMessage);
+      expect(f.modified.getTime()).toBe(c.modified.getTime());
+      expect(f.parentSessionPath).toBe(c.parentSessionPath);
+      // The rename lives after the first user message → forward-only doesn't see
+      // it; resolveSessionName recovers it, matching the combined name.
+      expect(f.name).toBeUndefined();
+      const tail = resolveSessionName({ path: f.path, mtimeMs: c.modified.getTime(), size: statSync(f.path).size });
+      const resolvedName = tail.found ? tail.name : f.name;
+      expect(resolvedName).toBe(c.name);
+    }
   });
 });

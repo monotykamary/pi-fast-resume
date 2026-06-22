@@ -1,5 +1,20 @@
-export { parseSessionFromBuffer, loadSessionHeader, loadSessionHeaders, scanAllSessionDirs, scanSessionDir, sortByModified, sortByModifiedDesc, filterByCwd, matchQuery, canonicalizePath } from "./scanner.js";
-export type { SessionHeader, SessionFileMeta } from "./scanner.js";
+export {
+  parseSessionFromBuffer,
+  scanTailForSessionInfo,
+  loadSessionHeader,
+  loadSessionHeaderForward,
+  loadSessionHeaders,
+  loadSessionHeadersForward,
+  resolveSessionName,
+  scanAllSessionDirs,
+  scanSessionDir,
+  sortByModified,
+  sortByModifiedDesc,
+  filterByCwd,
+  matchQuery,
+  canonicalizePath,
+} from "./scanner.js";
+export type { SessionHeader, SessionFileMeta, TailSessionInfo } from "./scanner.js";
 export {
   parseSearchQuery,
   matchSession,
