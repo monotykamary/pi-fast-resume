@@ -1,10 +1,11 @@
-import { describe, it, expect } from "vitest";
+import { describe, it, expect, afterEach } from "vitest";
 import {
   parseSessionFromBuffer,
   sortByModified,
   filterByCwd,
   matchQuery,
   canonicalizePath,
+  clearCanonicalPathCache,
   scanAllSessionDirs,
   scanSessionDir,
   scanTailForSessionInfo,
@@ -13,7 +14,9 @@ import {
   loadSessionHeaderForward,
   loadSessionHeadersForward,
   resolveSessionName,
+  resolveSessionNamesDeferred,
   type SessionHeader,
+  type SessionFileMeta,
   type TailSessionInfo,
 } from "../src/scanner.js";
 import {
@@ -27,7 +30,7 @@ import {
   type FlatSessionNode,
   type SortMode,
 } from "../src/search.js";
-import { existsSync, mkdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, statSync, writeFileSync, realpathSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 
@@ -435,6 +438,8 @@ describe("matchQuery", () => {
 });
 
 describe("canonicalizePath", () => {
+  afterEach(() => clearCanonicalPathCache());
+
   it("canonicalizes an existing path", () => {
     const result = canonicalizePath(process.cwd());
     expect(result).toBe(process.cwd());
@@ -444,6 +449,38 @@ describe("canonicalizePath", () => {
     const nonexistent = "/this/path/does/not/exist/abc123";
     const result = canonicalizePath(nonexistent);
     expect(result).toBe(nonexistent);
+  });
+
+  it("memoizes results — repeat calls return the cached value without re-resolving", () => {
+    // A nonexistent path resolves to itself and is cached. If the path later
+    // appears, the cache still serves the prior result (memoization, not live
+    // resolution) — matching the documented process-lifetime semantics.
+    const ghost = join(tmpdir(), "pi-fast-resume-ghost-" + process.pid + "-" + Date.now());
+    expect(existsSync(ghost)).toBe(false);
+    expect(canonicalizePath(ghost)).toBe(ghost); // caches ghost → ghost
+    mkdirSync(ghost, { recursive: true });
+    try {
+      // Cached value is served even though the path now exists.
+      expect(canonicalizePath(ghost)).toBe(ghost);
+    } finally {
+      rmSync(ghost, { recursive: true, force: true });
+    }
+  });
+
+  it("clearCanonicalPathCache forces the next call to re-resolve", () => {
+    const dir = join(tmpdir(), "pi-fast-resume-reresolve-" + process.pid + "-" + Date.now());
+    // Nonexistent → resolves to itself and is cached.
+    expect(canonicalizePath(dir)).toBe(dir);
+    mkdirSync(dir, { recursive: true });
+    try {
+      // Still cached → serves the stale (pre-existence) value.
+      expect(canonicalizePath(dir)).toBe(dir);
+      clearCanonicalPathCache();
+      // After clearing, re-resolves to the true canonical path.
+      expect(canonicalizePath(dir)).toBe(realpathSync(dir));
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
   });
 });
 
@@ -1342,6 +1379,216 @@ describe("deferred name resolution (forward-only + resolveSessionName)", () => {
       const tail = resolveSessionName({ path: f.path, mtimeMs: c.modified.getTime(), size: statSync(f.path).size });
       const resolvedName = tail.found ? tail.name : f.name;
       expect(resolvedName).toBe(c.name);
+    }
+  });
+});
+
+describe("forward-pass bookkeeping (_fwdReachedEof / _fwdConsumedBytes)", () => {
+  const testDir = join(tmpdir(), "pi-fast-resume-fwdbook-" + process.pid);
+  afterEach(() => rmSync(testDir, { recursive: true, force: true }));
+
+  function writeSession(file: string, lines: unknown[]) {
+    mkdirSync(testDir, { recursive: true });
+    const p = join(testDir, file);
+    writeFileSync(p, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    const st = statSync(p);
+    return { path: p, mtimeMs: st.mtimeMs, size: st.size };
+  }
+
+  it("sets _fwdReachedEof=true when the forward pass consumes the whole file (no user message)", () => {
+    // A header-only session: no user message → forward reads to EOF.
+    const meta = writeSession("header-only.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "session_info", name: "Named before any message" },
+    ]);
+    const fwd = loadSessionHeaderForward(meta)!;
+    expect(fwd._fwdReachedEof).toBe(true);
+    // Forward saw the session_info (reached EOF) → name is already final.
+    expect(fwd.name).toBe("Named before any message");
+    // consumedBytes covers the whole file.
+    expect(fwd._fwdConsumedBytes).toBe(meta.size);
+  });
+
+  it("sets _fwdReachedEof=false and _fwdConsumedBytes< size when the forward pass stops at the first user message", () => {
+    const oversized = "x".repeat(20_000);
+    const meta = writeSession("stopped.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: [{ type: "text", text: oversized }] } },
+      { type: "session_info", name: "Past the stop" },
+    ]);
+    const fwd = loadSessionHeaderForward(meta)!;
+    expect(fwd._fwdReachedEof).toBe(false);
+    expect(fwd._fwdConsumedBytes!).toBeLessThan(meta.size);
+    expect(fwd._fwdConsumedBytes!).toBeGreaterThan(0);
+    // The rename lives past the forward stop → not yet visible.
+    expect(fwd.name).toBeUndefined();
+  });
+});
+
+describe("resolveSessionName consumedBytesLowerBound", () => {
+  const testDir = join(tmpdir(), "pi-fast-resume-bound-" + process.pid);
+  afterEach(() => rmSync(testDir, { recursive: true, force: true }));
+
+  function writeSession(file: string, lines: unknown[]) {
+    mkdirSync(testDir, { recursive: true });
+    const p = join(testDir, file);
+    writeFileSync(p, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    const st = statSync(p);
+    return { path: p, mtimeMs: st.mtimeMs, size: st.size };
+  }
+
+  it("with no bound reads the whole last 32KB (backward-compatible default)", () => {
+    const meta = writeSession("nobound.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: "x".repeat(20_000) } },
+      { type: "session_info", name: "At EOF" },
+    ]);
+    const tail = resolveSessionName(meta);
+    expect(tail.found).toBe(true);
+    expect(tail.name).toBe("At EOF");
+  });
+
+  it("with a lower bound equal to size returns found:false (forward already consumed everything)", () => {
+    const meta = writeSession("fullyread.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "session_info", name: "Named" },
+    ]);
+    // Forward pass reached EOF (consumed = size) → nothing left to tail-read.
+    const tail = resolveSessionName(meta, { consumedBytesLowerBound: meta.size });
+    expect(tail.found).toBe(false);
+    expect(tail.name).toBeUndefined();
+  });
+
+  it("with a lower bound skips the forward region but still recovers the rename from the remainder", () => {
+    // First user message early, rename at EOF, small file (< 32KB) so the
+    // unbounded tail would re-read the forward region. The bound makes the tail
+    // start after the forward-consumed bytes; the rename (in the remainder) is
+    // still recovered — matching the unbounded result.
+    const meta = writeSession("bounded.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: "first user message" } },
+      { type: "message", message: { role: "assistant", content: "reply" } },
+      { type: "session_info", name: "Bounded rename" },
+    ]);
+    const fwd = loadSessionHeaderForward(meta)!;
+    expect(fwd._fwdReachedEof).toBe(false);
+
+    const unbounded = resolveSessionName(meta);
+    const bounded = resolveSessionName(meta, { consumedBytesLowerBound: fwd._fwdConsumedBytes });
+    expect(bounded.found).toBe(true);
+    expect(bounded.name).toBe("Bounded rename");
+    expect(bounded).toEqual(unbounded); // same result, fewer bytes read
+  });
+});
+
+describe("resolveSessionNamesDeferred (skip + bound)", () => {
+  const testDir = join(tmpdir(), "pi-fast-resume-deferredall-" + process.pid);
+  afterEach(() => rmSync(testDir, { recursive: true, force: true }));
+
+  function writeSession(file: string, lines: unknown[]) {
+    mkdirSync(testDir, { recursive: true });
+    const p = join(testDir, file);
+    writeFileSync(p, lines.map((l) => JSON.stringify(l)).join("\n") + "\n");
+    const st = statSync(p);
+    return { path: p, mtimeMs: st.mtimeMs, size: st.size } as SessionFileMeta;
+  }
+
+  it("skips headers whose forward pass reached EOF (name already final)", () => {
+    const m = writeSession("header-only.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "session_info", name: "Final already" },
+    ]);
+    const [fwd] = loadSessionHeadersForward([m]);
+    expect(fwd._fwdReachedEof).toBe(true);
+
+    const metaByPath = new Map<string, SessionFileMeta>([[m.path, m]]);
+    const updates = resolveSessionNamesDeferred([fwd], metaByPath);
+    // Reached EOF → not enqueued for resolution → no update (name stays as-is).
+    expect(updates.size).toBe(0);
+  });
+
+  it("recovers renames for stopped-early headers and matches the combined load", () => {
+    const m = writeSession("renamed.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: "x".repeat(20_000) } },
+      { type: "session_info", name: "Latest rename" },
+    ]);
+    const [fwd] = loadSessionHeadersForward([m]);
+    expect(fwd._fwdReachedEof).toBe(false);
+    expect(fwd.name).toBeUndefined();
+
+    const metaByPath = new Map<string, SessionFileMeta>([[m.path, m]]);
+    const updates = resolveSessionNamesDeferred([fwd], metaByPath);
+    expect(updates.get(m.path)).toBe("Latest rename");
+
+    // Applying the update yields the combined load's name.
+    const [combined] = loadSessionHeaders([m]);
+    const resolved = updates.has(m.path) ? updates.get(m.path) : fwd.name;
+    expect(resolved).toBe(combined.name);
+  });
+
+  it("applies an explicit clear (found:true, name:undefined) as undefined", () => {
+    const m = writeSession("cleared.jsonl", [
+      { type: "session", id: "a", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: "x".repeat(20_000) } },
+      { type: "session_info", name: "Named" },
+      { type: "session_info", name: "   " }, // explicit clear at EOF
+    ]);
+    const [fwd] = loadSessionHeadersForward([m]);
+    const metaByPath = new Map<string, SessionFileMeta>([[m.path, m]]);
+    const updates = resolveSessionNamesDeferred([fwd], metaByPath);
+    expect(updates.has(m.path)).toBe(true);
+    expect(updates.get(m.path)).toBeUndefined();
+  });
+
+  it("over a mixed corpus, forward + deferred equals the combined load for every session", () => {
+    // The full deferred contract: for a realistic mix (header-only, small,
+    // normal, oversized), applying the deferred updates to the forward-only
+    // headers reproduces exactly what the combined load produces — including
+    // names, explicit clears, and unnamed sessions.
+    const metas: SessionFileMeta[] = [];
+    metas.push(writeSession("header-only.jsonl", [
+      { type: "session", id: "h", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "session_info", name: "Header name" },
+    ]));
+    metas.push(writeSession("small-named.jsonl", [
+      { type: "session", id: "s", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: "hi" } },
+      { type: "session_info", name: "Small name" },
+    ]));
+    metas.push(writeSession("small-unnamed.jsonl", [
+      { type: "session", id: "u", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: "hi" } },
+    ]));
+    metas.push(writeSession("normal-named.jsonl", [
+      { type: "session", id: "n", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: "first" } },
+      { type: "message", message: { role: "assistant", content: "reply" } },
+      { type: "session_info", name: "Normal name" },
+    ]));
+    metas.push(writeSession("oversized-cleared.jsonl", [
+      { type: "session", id: "o", timestamp: "2026-01-15T10:00:00Z", cwd: "/p" },
+      { type: "message", message: { role: "user", content: "x".repeat(20_000) } },
+      { type: "message", message: { role: "assistant", content: "y".repeat(40_000) } },
+      { type: "session_info", name: "Named then cleared" },
+      { type: "session_info", name: "" },
+    ]));
+
+    const fwd = loadSessionHeadersForward(metas);
+    const full = loadSessionHeaders(metas);
+    const metaByPath = new Map<string, SessionFileMeta>(metas.map((m) => [m.path, m]));
+
+    for (const f of fwd) {
+      const c = full.find((h) => h.path === f.path)!;
+      const updates = resolveSessionNamesDeferred([f], metaByPath);
+      const resolved = updates.has(f.path) ? updates.get(f.path) : f.name;
+      // Non-name fields are identical between forward-only and combined.
+      expect(f.id).toBe(c.id);
+      expect(f.cwd).toBe(c.cwd);
+      expect(f.firstMessage).toBe(c.firstMessage);
+      expect(f.parentSessionPath).toBe(c.parentSessionPath);
+      // The deferred model reproduces the combined name in every case.
+      expect(resolved).toBe(c.name);
     }
   });
 });

@@ -6,6 +6,7 @@ export {
   loadSessionHeaders,
   loadSessionHeadersForward,
   resolveSessionName,
+  resolveSessionNamesDeferred,
   scanAllSessionDirs,
   scanSessionDir,
   sortByModified,
@@ -13,6 +14,7 @@ export {
   filterByCwd,
   matchQuery,
   canonicalizePath,
+  clearCanonicalPathCache,
 } from "./scanner.js";
 export type { SessionHeader, SessionFileMeta, TailSessionInfo } from "./scanner.js";
 export {

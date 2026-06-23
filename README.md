@@ -47,6 +47,8 @@ Tested with **1,771 sessions, 1.46 GB** of JSONL data on disk.
 | **pi-fast-resume (partial read)** | **6 ms**     | ~580 ms   |
 | DuckDB NDJSON full scan           | 2,560 ms     | 2,560 ms  |
 
+> The all-dirs `stat()` pass (~100 ms at scale) now runs **after** first paint, so first paint no longer depends on total session count — only on the current project's session dir.
+
 <details>
 <summary><strong>Full benchmark table</strong></summary>
 
@@ -165,8 +167,8 @@ Press `Tab` to switch to **all sessions** — shows every session pi knows about
 ## How it works
 
 ```
-stat() all .jsonl files ──────► sort by mtime ──────► stream top 30 forward
-      (~100ms)                   (recent first)          (~6ms)
+stat() current dir's .jsonl ──► sort by mtime ──► stream top rows forward
+      (~cheap, one dir)          (recent first)        (~6ms)
                                                             │
                                                             ▼
                                                     ┌─────────────────┐
@@ -174,15 +176,17 @@ stat() all .jsonl files ──────► sort by mtime ──────�
                                                     │  immediately    │
                                                     └────────┬────────┘
                                                              │
-                                              Background: load rest in batches of 50
-                                              (non-blocking via setImmediate)
+                          Background (after first paint):
+                          1. stat() ALL session dirs (~100ms at scale) — deferred off the critical path
+                          2. forward-load all-scope headers in batches of 50 (non-blocking via setImmediate)
+                          3. resolve rename names in the background (skip header-only files; bound each tail read)
 ```
 
-1. **`stat()` all session files** — collect paths and mtimes (~100 ms for 1,700 files)
+1. **`stat()` the current project's session dir** — collect paths and mtimes (cheap, one directory)
 2. **Sort by mtime descending** — most recent sessions first
-3. **Stream each file forward** line by line until the first user message, then read a bounded tail at EOF for the latest rename name (~6 ms)
+3. **Stream each file forward** line by line until the first user message (~6 ms for the first screen)
 4. **Show picker** — user can navigate, filter, and select immediately
-5. **Background load** — remaining sessions stream in batches of 50, non-blocking
+5. **Background load** — after first paint, stat every session dir, then stream remaining sessions in batches of 50, non-blocking
 6. **Tab to switch scope** — filter to current project or show everything
 
 No indexing. No database. No persistent state. Just reads the files on disk.

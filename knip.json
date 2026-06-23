@@ -2,5 +2,6 @@
   "$schema": "https://unpkg.com/knip@5/schema.json",
   "ignoreExportsUsedInFile": true,
   "entry": ["fast-resume.ts", "src/index.ts"],
-  "project": ["**/*.ts"]
+  "project": ["**/*.ts"],
+  "ignore": ["__tests__/**/*.bench.ts"]
 }

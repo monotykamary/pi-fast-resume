@@ -13,6 +13,12 @@ export interface SessionHeader {
   messageCount: number;
   firstMessage: string;
   name?: string;
+  // Internal forward-pass bookkeeping for the deferred rename-name resolver.
+  // Not part of the public contract; only loadSessionHeaderForward sets these.
+  /** @internal forward pass consumed the whole file — forward name is final; the deferred tail resolver skips it. */
+  _fwdReachedEof?: boolean;
+  /** @internal bytes the forward pass consumed — lower bound for the deferred tail read so it never re-reads covered bytes. */
+  _fwdConsumedBytes?: number;
 }
 
 export interface SessionFileMeta {
@@ -417,12 +423,20 @@ export function loadSessionHeaderForward(
   try {
     fd = openSync(meta.path, "r");
     const acc = newAccumulator();
-    const { reachedEof } = forEachLineForward(fd, meta.size, (line) => {
+    const { reachedEof, consumedBytes } = forEachLineForward(fd, meta.size, (line) => {
       processEntry(acc, line);
       if (acc.header && acc.foundFirstUser) return false;
       return true;
     });
-    return buildHeader(acc, meta.path, meta.mtimeMs, reachedEof);
+    const header = buildHeader(acc, meta.path, meta.mtimeMs, reachedEof);
+    if (header) {
+      // Carry forward-pass bookkeeping so the deferred rename-name resolver can
+      // skip files whose forward pass reached EOF (name already final) and bound
+      // its tail read below by the consumed bytes (never re-reads covered bytes).
+      header._fwdReachedEof = reachedEof;
+      header._fwdConsumedBytes = consumedBytes;
+    }
+    return header;
   } catch {
     return null;
   } finally {
@@ -439,14 +453,28 @@ export function loadSessionHeaderForward(
 // This is the deferred half of loadSessionHeader, exposed so callers can show
 // a row immediately with the forward name and resolve the rename name in the
 // background. Reading up to TAIL_READ_SIZE bytes from EOF may overlap the
-// forward region for small files; that is a redundant re-read of a small range
-// (no correctness impact — the latest session_info wins either way).
-export function resolveSessionName(meta: SessionFileMeta): TailSessionInfo {
+// forward region for small files. Pass `consumedBytesLowerBound` (the forward
+// pass's consumedBytes) so the tail starts at/after the bytes the forward pass
+// already parsed — avoiding a redundant re-read and re-parse of that range.
+// When the bound equals the file size (the forward pass reached EOF) there are
+// no bytes left to read and this returns found:false; callers that already
+// know the forward pass reached EOF should skip the call entirely (see
+// resolveSessionNamesDeferred).
+export function resolveSessionName(
+  meta: SessionFileMeta,
+  options?: { consumedBytesLowerBound?: number },
+): TailSessionInfo {
   if (meta.size <= 0) return { found: false };
+  // Bound the tail below by the forward pass's consumed bytes so it never
+  // re-reads bytes the forward pass already covered. Matches the combined
+  // loadSessionHeader path's tail math: tailReadSize = min(TAIL, size - bound),
+  // tailOffset = size - tailReadSize (>= bound).
+  const lowerBound = Math.max(0, Math.min(options?.consumedBytesLowerBound ?? 0, meta.size));
+  const tailReadSize = Math.min(TAIL_READ_SIZE, meta.size - lowerBound);
+  if (tailReadSize <= 0) return { found: false };
   let fd: number | undefined;
   try {
     fd = openSync(meta.path, "r");
-    const tailReadSize = Math.min(TAIL_READ_SIZE, meta.size);
     const tailBuf = Buffer.alloc(tailReadSize);
     const tailOffset = meta.size - tailReadSize;
     const tailBytesRead = readSync(fd, tailBuf, 0, tailReadSize, tailOffset);
@@ -456,6 +484,28 @@ export function resolveSessionName(meta: SessionFileMeta): TailSessionInfo {
   } finally {
     if (fd !== undefined) closeSync(fd);
   }
+}
+
+// Resolve rename names for a batch of forward-loaded headers, the pure core of
+// the picker's cooperative name-resolution drain. Skips headers whose forward
+// pass reached EOF (their name is already final — no tail read needed) and
+// bounds each remaining tail read below by the forward pass's consumed bytes
+// (never re-reads already-covered bytes). Returns only paths whose tail found
+// a session_info (name may be undefined for an explicit clear), for the caller
+// to apply in-place. Exposed for direct testing and benchmarking.
+export function resolveSessionNamesDeferred(
+  headers: SessionHeader[],
+  metaByPath: Map<string, SessionFileMeta>,
+): Map<string, string | undefined> {
+  const updates = new Map<string, string | undefined>();
+  for (const h of headers) {
+    if (h._fwdReachedEof) continue; // forward pass saw every session_info
+    const meta = metaByPath.get(h.path);
+    if (!meta) continue;
+    const tail = resolveSessionName(meta, { consumedBytesLowerBound: h._fwdConsumedBytes });
+    if (tail.found) updates.set(h.path, tail.name);
+  }
+  return updates;
 }
 
 // Load a session header using a streaming forward read plus a bounded tail read
@@ -557,16 +607,37 @@ export function filterByCwd(
   });
 }
 
+// Process-lifetime memo of realpath results. canonicalizePath is called
+// 2–3× per session per tree build (buildSessionTree) and once per visible row
+// per render (isCurrentSessionPath), and the tree is rebuilt on every keystroke
+// in threaded mode. realpathSync is a syscall (~µs each); memoizing collapses
+// thousands of syscalls per keystroke to Map lookups. This is pure memoization
+// (no persistent file, no staleness to manage) — realpath of a path is stable
+// for the process lifetime unless a symlink target changes, which doesn't
+// happen to session files under ~/.pi/agent/sessions. Call
+// clearCanonicalPathCache() to reset (used by tests/benches).
+const canonicalPathCache = new Map<string, string>();
+
 /**
- * Canonicalize a file path by resolving symlinks.
+ * Canonicalize a file path by resolving symlinks, memoized per process.
  * Matches pi-core's canonicalizePath behavior (realpathSync with fallback).
  */
 export function canonicalizePath(path: string): string {
+  const cached = canonicalPathCache.get(path);
+  if (cached !== undefined) return cached;
+  let result: string;
   try {
-    return realpathSync(path);
+    result = realpathSync(path);
   } catch {
-    return path;
+    result = path;
   }
+  canonicalPathCache.set(path, result);
+  return result;
+}
+
+/** Clear the canonicalizePath memo. Intended for tests/benches. */
+export function clearCanonicalPathCache(): void {
+  canonicalPathCache.clear();
 }
 
 export function matchQuery(
