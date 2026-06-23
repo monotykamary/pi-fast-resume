@@ -167,7 +167,7 @@ Press `Tab` to switch to **all sessions** — shows every session pi knows about
 ## How it works
 
 ```
-stat() current dir's .jsonl ──► sort by mtime ──► stream top rows forward
+stat() current dir's .jsonl ──► sort by mtime ──► stream top 30 forward
       (~cheap, one dir)          (recent first)        (~6ms)
                                                             │
                                                             ▼
@@ -177,16 +177,17 @@ stat() current dir's .jsonl ──► sort by mtime ──► stream top rows fo
                                                     └────────┬────────┘
                                                              │
                           Background (after first paint):
-                          1. stat() ALL session dirs (~100ms at scale) — deferred off the critical path
-                          2. forward-load all-scope headers in batches of 50 (non-blocking via setImmediate)
-                          3. resolve rename names in the background (skip header-only files; bound each tail read)
+                          1. stream the rest of the current dir in batches of 50 (rows appear as they load)
+                          2. stat() ALL session dirs (~100ms at scale) — deferred off the critical path
+                          3. forward-load all-scope headers in batches of 50 (non-blocking via setImmediate)
+                          4. resolve rename names in the background (skip header-only files; bound each tail read)
 ```
 
 1. **`stat()` the current project's session dir** — collect paths and mtimes (cheap, one directory)
 2. **Sort by mtime descending** — most recent sessions first
-3. **Stream each file forward** line by line until the first user message (~6 ms for the first screen)
+3. **Stream the top 30 forward** line by line until the first user message (~6 ms for the first screen)
 4. **Show picker** — user can navigate, filter, and select immediately
-5. **Background load** — after first paint, stat every session dir, then stream remaining sessions in batches of 50, non-blocking
+5. **Background load** — after first paint, stream the remaining current-scope sessions in batches of 50, then stat every session dir and forward-load the all-scope headers, non-blocking
 6. **Tab to switch scope** — filter to current project or show everything
 
 No indexing. No database. No persistent state. Just reads the files on disk.

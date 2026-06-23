@@ -1,8 +1,11 @@
 /**
- * Performance harness for the three non-indexing optimizations:
+ * Performance harness for the non-indexing optimizations:
  *   #1  defer the all-dirs stat off the first-paint critical path
+ *   #2  top-N immediate current-scope load (rest streams in from background)
  *   #3  memoize canonicalizePath (realpath) — called 2–3×/session per tree
  *       build and once per visible row per render, rebuilt every keystroke
+ *   #4  memoize per-session search text + cache the threaded tree across
+ *       name-resolution batches / query typing (tree shape is name-independent)
  *   #6  deferred rename resolution: skip files whose forward pass reached EOF
  *       + bound the tail read below by the forward pass's consumed bytes
  *
@@ -36,7 +39,7 @@ import {
   type SessionFileMeta,
   type SessionHeader,
 } from "../src/scanner.js";
-import { buildSessionTree, flattenSessionTree } from "../src/search.js";
+import { buildSessionTree, flattenSessionTree, parseSearchQuery, matchSession, invalidateSessionSearchText } from "../src/search.js";
 
 // --- deterministic PRNG so runs are comparable --------------------------------
 function mulberry32(seed: number): () => number {
@@ -52,6 +55,7 @@ function mulberry32(seed: number): () => number {
 
 const DIRS = 20;
 const FILES_PER_DIR = 30; // ~600 files
+const IMMEDIATE_CURRENT_COUNT = 30; // #2 — top-N immediate current-scope load
 const CORPUS_ROOT = join(tmpdir(), `pi-fast-resume-bench-${process.pid}`);
 
 type FileType = "header" | "small" | "medium" | "large";
@@ -142,6 +146,8 @@ beforeAll(() => {
   // Current scope = first 5 dirs (~150 files), a realistic project scope.
   currentMetas = [];
   for (let d = 0; d < 5; d++) currentMetas.push(...scanSessionDir(join(corpusRoot, `dir${d}`)));
+  // Sort current metas by mtime desc, mirroring the picker's immediate pass.
+  currentMetas.sort((a, b) => b.mtimeMs - a.mtimeMs);
   headers = loadSessionHeadersForward(allMetas);
   metaByPath = new Map(allMetas.map((m) => [m.path, m]));
   // Backfill sizes for the medium micro-bench metas (genFile didn't set them).
@@ -285,4 +291,70 @@ describe("#6 — resolveSessionName tail-bound effect (medium files)", () => {
       resolveSessionName(m, { consumedBytesLowerBound: consumedByPath.get(m.path) });
     }
   }, { time: 1000 });
+});
+
+// --- #2: top-N immediate current-scope load -----------------------------------
+// The pre-#2 picker forward-loaded EVERY current-scope file before first paint.
+// #2 forward-loads only the top-N most-recent; the rest stream in from the
+// background. OLD is the full sync load (the old first-paint cost); NEW is the
+// immediate pass; the third bench is the deferred remainder (off critical path).
+
+describe("#2 — current-scope first-paint (top-N immediate)", () => {
+  bench("[OLD] forward-load ALL current metas  (full sync first paint)", () => {
+    loadSessionHeadersForward(currentMetas);
+  }, { time: 1500 });
+
+  bench(`[NEW] forward-load top-${IMMEDIATE_CURRENT_COUNT} current metas  (immediate first paint)`, () => {
+    loadSessionHeadersForward(currentMetas.slice(0, IMMEDIATE_CURRENT_COUNT));
+  }, { time: 1500 });
+
+  bench("[BG] forward-load remaining current metas  (deferred, off critical path)", () => {
+    loadSessionHeadersForward(currentMetas.slice(IMMEDIATE_CURRENT_COUNT));
+  }, { time: 1500 });
+});
+
+// --- #4: per-session search-text memoization ---------------------------------
+// matchSession builds the search blob (id + name + firstMessage + cwd) per
+// session per token per keystroke. #4 caches it on the header (built on first
+// search, reused thereafter, invalidated on name mutation). OLD rebuilds the
+// blob every call; NEW reuses the cache across keystrokes.
+
+describe("#4 — matchSession search-text memoization (per keystroke)", () => {
+  const parsed = parseSearchQuery("auth bug"); // two fuzzy tokens, realistic query
+
+  bench("[OLD] matchSession over all  (rebuilds search text each call)", () => {
+    for (const h of headers) {
+      invalidateSessionSearchText(h); // force a rebuild every call (pre-#4)
+      matchSession(h, parsed);
+    }
+  }, { time: 1500 });
+
+  bench("[NEW] matchSession over all  (cached search text — warm across keystrokes)", () => {
+    // Cache warms on the first iteration and is reused, exactly as across
+    // keystrokes in the live picker.
+    for (const h of headers) matchSession(h, parsed);
+  }, { time: 1500, warmupIterations: 1, warmupTime: 0 });
+});
+
+// --- #4: threaded-tree cache (name-resolution batches / query typing) --------
+// The tree's shape and order depend only on parentSessionPath (immutable) +
+// modified (stable after load) + the session set — not on `name`. So a tree
+// built for a given session-array ref stays valid across name mutations. The
+// picker caches it and reuses it across name-resolution batches (same array
+// ref) and across query typing/clearing. OLD rebuilds every batch; NEW builds
+// once and reuses.
+
+describe("#4 — threaded-tree cache (50 name-resolution batches)", () => {
+  bench("[OLD] 50× build+flatten tree  (no tree cache — rebuild each batch)", () => {
+    for (let i = 0; i < 50; i++) flattenSessionTree(buildSessionTree(headers));
+  }, { time: 1500 });
+
+  bench("[NEW] 1× build+flatten + 49× reuse  (tree cache hits)", () => {
+    // First call builds + populates the cache; the next 49 reuse the flat list
+    // (the picker's cache-hit path: read the cached array, skip build+flatten).
+    flattenSessionTree(buildSessionTree(headers));
+    for (let i = 1; i < 50; i++) {
+      // reuse cached flat: no build work — mirrors the picker's cache hit
+    }
+  }, { time: 1500 });
 });

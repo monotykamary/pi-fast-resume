@@ -19,6 +19,11 @@ export interface SessionHeader {
   _fwdReachedEof?: boolean;
   /** @internal bytes the forward pass consumed — lower bound for the deferred tail read so it never re-reads covered bytes. */
   _fwdConsumedBytes?: number;
+  // Internal lazy cache for the search blob (id + name + firstMessage + cwd).
+  // Built on first matchSession call, invalidated when `name` mutates (rename
+  // resolution). Keeps per-keystroke search from re-concatenating per session.
+  /** @internal */
+  _searchText?: string;
 }
 
 export interface SessionFileMeta {

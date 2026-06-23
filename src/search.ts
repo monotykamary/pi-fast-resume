@@ -45,9 +45,22 @@ function normalizeWhitespaceLower(text: string): string {
  * matches are unaffected.
  *
  * See README "Known Limitations" section for the user-facing explanation.
+ *
+ * Memoized on the session (`_searchText`): matchSession is called per session
+ * per token per keystroke, so the concatenation is built once on first search
+ * and reused thereafter. Invalidate via invalidateSessionSearchText when
+ * `name` mutates (the picker's rename-name resolution updates names in place).
  */
 function getSessionSearchText(session: SessionHeader): string {
-  return `${session.id} ${session.name ?? ""} ${session.firstMessage} ${session.cwd}`;
+  if (session._searchText !== undefined) return session._searchText;
+  const text = `${session.id} ${session.name ?? ""} ${session.firstMessage} ${session.cwd}`;
+  session._searchText = text;
+  return text;
+}
+
+/** Drop the cached search blob so the next getSessionSearchText rebuilds it. */
+export function invalidateSessionSearchText(session: SessionHeader): void {
+  session._searchText = undefined;
 }
 
 export function parseSearchQuery(query: string): ParsedSearch {

@@ -20,6 +20,7 @@ export type { SessionHeader, SessionFileMeta, TailSessionInfo } from "./scanner.
 export {
   parseSearchQuery,
   matchSession,
+  invalidateSessionSearchText,
   hasSessionName,
   filterAndSortSessions,
   buildSessionTree,

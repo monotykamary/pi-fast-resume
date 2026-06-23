@@ -22,6 +22,7 @@ import {
 import {
   parseSearchQuery,
   matchSession,
+  invalidateSessionSearchText,
   hasSessionName,
   filterAndSortSessions,
   buildSessionTree,
@@ -601,6 +602,67 @@ describe("matchSession", () => {
     const result = matchSession(session, parsed);
     expect(result.matches).toBe(true);
     expect(typeof result.score).toBe("number");
+  });
+});
+
+describe("search-text cache (getSessionSearchText memoization)", () => {
+  // matchSession builds the search blob (id + name + firstMessage + cwd) per
+  // session and caches it on `_searchText`. The cache must be dropped when
+  // `name` mutates (rename resolution updates names in place) so a later search
+  // sees the new name.
+
+  it("matchSession populates _searchText on first call", () => {
+    const session = makeSession({ firstMessage: "Fix auth bypass" });
+    expect(session._searchText).toBeUndefined();
+    matchSession(session, parseSearchQuery("auth"));
+    expect(session._searchText).toContain("test-id-1234");
+    expect(session._searchText).toContain("Fix auth bypass");
+    expect(session._searchText).toContain("/Users/test/project");
+  });
+
+  it("cached blob is reused (a name change WITHOUT invalidation is stale)", () => {
+    // Proves the cache exists and is consulted: after the first search, a name
+    // change is NOT reflected until the cache is invalidated.
+    const session = makeSession({ firstMessage: "original first" });
+    matchSession(session, parseSearchQuery("original"));
+    const cached = session._searchText;
+    expect(cached).toContain("original first");
+
+    // Mutate name after the cache is built.
+    session.name = "renamed-name";
+    // Still cached → the blob does NOT contain the new name.
+    matchSession(session, parseSearchQuery("renamed-name"));
+    expect(session._searchText).toBe(cached);
+    expect(session._searchText).not.toContain("renamed-name");
+  });
+
+  it("invalidateSessionSearchText drops the cache so the next search rebuilds", () => {
+    const session = makeSession({ firstMessage: "first msg", name: "old-name" });
+    matchSession(session, parseSearchQuery("old-name"));
+    expect(session._searchText).toContain("old-name");
+
+    session.name = "new-name";
+    invalidateSessionSearchText(session);
+    expect(session._searchText).toBeUndefined();
+
+    // Rebuild picks up the new name.
+    matchSession(session, parseSearchQuery("new-name"));
+    expect(session._searchText).toContain("new-name");
+    expect(matchSession(session, parseSearchQuery("new-name")).matches).toBe(true);
+  });
+
+  it("invalidation makes a previously-unmatched name searchable", () => {
+    // End-to-end: a session whose name resolves in the background must become
+    // searchable by the new name after invalidation.
+    const session = makeSession({ firstMessage: "unrelated first message" });
+    matchSession(session, parseSearchQuery("unrelated")); // builds cache without a name
+
+    session.name = "resolved-later";
+    // Without invalidation, searching for the new name misses (cache is stale).
+    expect(matchSession(session, parseSearchQuery("resolved-later")).matches).toBe(false);
+
+    invalidateSessionSearchText(session);
+    expect(matchSession(session, parseSearchQuery("resolved-later")).matches).toBe(true);
   });
 });
 

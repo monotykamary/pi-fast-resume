@@ -84,6 +84,7 @@ import {
 import {
   parseSearchQuery,
   matchSession,
+  invalidateSessionSearchText,
   hasSessionName,
   filterAndSortSessions,
   buildSessionTree,
@@ -96,6 +97,13 @@ import {
 } from "./src/search.js";
 
 const HOME = homedir();
+
+// #2 — Top-N immediate current-scope load. Forward-load this many most-recent
+// sessions before first paint; the rest stream in from the background in
+// batches of 50. 30 covers the visible page (maxVisible=10) with a scroll
+// buffer. Projects with fewer sessions load fully in the immediate pass and
+// never start the background current load.
+const IMMEDIATE_CURRENT_COUNT = 30;
 
 // Config — read from ~/.pi/agent/extensions/pi-fast-resume.json
 // Example: { "hijackResume": false, "shortcut": "alt+u" }
@@ -125,23 +133,30 @@ export interface FastResumeResult {
 
 type StatusMessage = { type: "info" | "error"; message: string };
 
-// Session loading helpers — mirror SessionManager.list / listAll behavior
-// while keeping partial reads.
-
-function loadCurrentSessionsImmediate(
+// #2 — Load the current-scope sessions in two phases: forward-load the top-N
+// most-recent headers immediately (the first paint), and return the remaining
+// metas for the picker's background current-scope load. `allMetas` is every
+// current-scope meta (used to seed the path→meta lookup for rename-name
+// resolution). For custom session dirs, headers are filtered to the current cwd
+// (matching SessionManager.list); the cwd filter is re-applied to the
+// background batches so the streamed rows stay cwd-correct.
+function loadCurrentSessionsTopN(
   cwd: string,
   sessionDir: string | undefined,
   usesDefaultSessionDir: boolean,
-): { headers: SessionHeader[]; metas: SessionFileMeta[] } {
-  if (!sessionDir) return { headers: [], metas: [] };
-  const metas = sortByModifiedDesc(scanSessionDir(sessionDir));
-  let headers = loadSessionHeadersForward(metas);
+  immediateCount: number,
+): { headers: SessionHeader[]; remaining: SessionFileMeta[]; allMetas: SessionFileMeta[] } {
+  if (!sessionDir) return { headers: [], remaining: [], allMetas: [] };
+  const allMetas = sortByModifiedDesc(scanSessionDir(sessionDir));
+  const immediateMetas = allMetas.slice(0, immediateCount);
+  const remaining = allMetas.slice(immediateCount);
+  let headers = loadSessionHeadersForward(immediateMetas);
   if (!usesDefaultSessionDir) {
     // Custom session dirs may contain sessions from multiple cwds; filter to
     // the current one, matching SessionManager.list behavior.
     headers = filterByCwd(headers, cwd);
   }
-  return { headers: sortByModified(headers), metas };
+  return { headers: sortByModified(headers), remaining, allMetas };
 }
 
 function loadAllSessionMetas(
@@ -349,6 +364,17 @@ class FastResumeSessionList implements Component {
   nameFilter: NameFilter = "all";
   confirmingDeletePath: string | null = null;
   maxVisible = 10;
+
+  // #4 — Cache for the threaded-mode tree (no-query path). The tree's shape and
+  // order depend only on parentSessionPath (immutable), modified (stable after
+  // load), and the session set — NOT on `name`. So a tree built for a given
+  // session-array reference stays valid across in-place name mutations (rename
+  // resolution) and across query typing/clearing, as long as the array ref is
+  // stable. Keyed on the `nameFilter==="all"` array (=== this.allSessions);
+  // the "named" subset depends on names and is never cached. setSessions passes
+  // a new ref on load/scope/mutation (cache misses → rebuild) and the same ref
+  // on name-resolution batches (cache hits → skip rebuild).
+  private _treeCache: { sessionsRef: SessionHeader[]; flat: FlatSessionNode[] } | null = null;
   currentSessionCanonicalPath: string | undefined;
 
   onSelect?: (sessionPath: string) => void;
@@ -432,11 +458,23 @@ class FastResumeSessionList implements Component {
     const trimmed = query.trim();
 
     if (this.sortMode === "threaded" && !trimmed) {
-      // Threaded mode without search: show tree structure
-      const roots = buildSessionTree(nameFiltered);
-      this.filteredNodes = flattenSessionTree(roots);
+      // Threaded mode without search: show tree structure. Cache it when the
+      // nameFiltered array is the stable all-sessions ref (nameFilter==="all")
+      // — the tree doesn't depend on names, so it survives in-place name
+      // mutations and query typing/clearing until the session set changes.
+      const canCache = this.nameFilter === "all"; // nameFiltered === this.allSessions
+      if (canCache && this._treeCache !== null && this._treeCache.sessionsRef === nameFiltered) {
+        this.filteredNodes = this._treeCache.flat;
+      } else {
+        const roots = buildSessionTree(nameFiltered);
+        const flat = flattenSessionTree(roots);
+        this.filteredNodes = flat;
+        if (canCache) this._treeCache = { sessionsRef: nameFiltered, flat };
+      }
     } else {
-      // Other modes or with search: flat list via filterAndSortSessions
+      // Other modes or with search: flat list via filterAndSortSessions. Leave
+      // the tree cache in place — a later "threaded + no query" reuses it as
+      // long as the session array ref is stable.
       const filtered = filterAndSortSessions(nameFiltered, query, this.sortMode);
       this.filteredNodes = filtered.map((session) => ({
         session,
@@ -676,6 +714,10 @@ class FastResumePicker extends Container {
   private allMetas: SessionFileMeta[] = [];
   private loadingAbort: AbortController | null = null;
   private allLoadSeq = 0;
+  private currentLoadSeq = 0;
+  // #2 — Current-scope metas not yet forward-loaded (beyond the top-N immediate
+  // pass). The background current load drains these in batches of 50.
+  private remainingCurrentMetas: SessionFileMeta[] = [];
 
   // Deferred rename-name resolution. The picker displays rows immediately
   // with forward-only headers (fast: ~80ms for 2.5k sessions); the latest rename
@@ -728,6 +770,7 @@ class FastResumePicker extends Container {
     usesDefaultSessionDir: boolean,
     currentSessionPath: string | undefined,
     initialCurrentSessions: SessionHeader[],
+    remainingCurrentMetas: SessionFileMeta[],
     currentMetas: SessionFileMeta[],
     done: (result: FastResumeResult) => void,
     tuiRequestRender: () => void,
@@ -842,8 +885,14 @@ class FastResumePicker extends Container {
     for (const m of currentMetas) this.metaByPath.set(m.path, m);
     this.enqueueNameResolution(initialCurrentSessions);
 
-    // Current scope is already loaded; the picker renders immediately.
-    this.currentLoading = false;
+    // #2 — Current scope shows the top-N headers immediately; the rest stream
+    // in from the background (silent: header stays on "◉ Current Folder",
+    // rows appear as batches complete). currentLoading tracks this for the
+    // rename guard and refresh cancellation; header.loading is NOT flipped so
+    // the initial view doesn't flash a loading state over visible rows.
+    this.remainingCurrentMetas = remainingCurrentMetas;
+    this.currentLoading = remainingCurrentMetas.length > 0;
+    if (this.currentLoading) this.startCurrentLoadBackground();
     this.header.loading = false;
 
     // Pre-load the all-scope metas + headers in the background. This stats all
@@ -924,9 +973,14 @@ class FastResumePicker extends Container {
   private async refreshSessionsAfterMutation(): Promise<void> {
     // Rescan from disk so renames, deletes, and newly created sessions are
     // reflected in the list. This mirrors upstream's loadScope(scope, "refresh").
-    // Bump the sequence number first so any in-progress background all-load
-    // stops before it can overwrite the rescanned data.
+    // Bump the sequence numbers first so any in-progress background loads
+    // (current top-N remainder or all-scope) stop before they can overwrite
+    // the rescanned data. rescanCurrentScope/AllScope do a full load (combined
+    // forward+tail) so the refreshed names are accurate.
     this.allLoadSeq++;
+    this.currentLoadSeq++;
+    this.currentLoading = false;
+    this.remainingCurrentMetas = [];
     try {
       if (this.scope === "current") {
         this.currentSessions = this.rescanCurrentScope();
@@ -946,6 +1000,78 @@ class FastResumePicker extends Container {
       this.header.loadProgress = null;
       const message = err instanceof Error ? err.message : String(err);
       this.header.setStatusMessage({ type: "error", message: `Failed to refresh: ${message}` }, 4000);
+    }
+  }
+
+  // #2 — Background current-scope load: forward-load the remaining current
+  // metas (those beyond the top-N immediate pass) in cooperative batches of
+  // 50, merging into currentSessions (re-sorted by modified) and streaming
+  // rows into the visible list when the user is on current scope. Silent — no
+  // header loading indicator (rows are already visible). Idempotent; cancelled
+  // by currentLoadSeq bumps (refresh) or loadingAbort (select/cancel/exit).
+  private startCurrentLoadBackground(): void {
+    if (this.remainingCurrentMetas.length === 0) {
+      this.currentLoading = false;
+      return;
+    }
+    this.currentLoading = true;
+    const seq = ++this.currentLoadSeq;
+    const sorted = this.remainingCurrentMetas;
+    setImmediate(() => this.runCurrentLoadHeaders(seq, sorted));
+  }
+
+  private runCurrentLoadHeaders(seq: number, sorted: SessionFileMeta[]): void {
+    const BATCH_SIZE = 50;
+    let offset = 0;
+    const parsed: SessionHeader[] = [];
+
+    const mergeAndShow = () => {
+      let merged = [...(this.currentSessions ?? []), ...parsed];
+      if (!this.usesDefaultSessionDir) merged = filterByCwd(merged, this.cwd);
+      this.currentSessions = sortByModified(merged);
+      if (this.scope === "current") {
+        this.sessionList.setSessions(this.currentSessions, false);
+        this.tuiRequestRender();
+      }
+    };
+
+    const loadBatch = () => {
+      if (seq !== this.currentLoadSeq) { this.currentLoading = false; return; } // stale
+      if (this.loadingAbort?.signal.aborted) { this.currentLoading = false; return; }
+
+      const batch = sorted.slice(offset, offset + BATCH_SIZE);
+      if (batch.length === 0) {
+        this.currentLoading = false;
+        mergeAndShow();
+        return;
+      }
+
+      let headers: SessionHeader[];
+      try {
+        headers = loadSessionHeadersForward(batch);
+      } catch (err) {
+        this.currentLoading = false;
+        this.handleCurrentLoadError(seq, err);
+        return;
+      }
+
+      parsed.push(...headers);
+      this.enqueueNameResolution(headers);
+      mergeAndShow();
+
+      offset += BATCH_SIZE;
+      setImmediate(loadBatch);
+    };
+
+    setImmediate(loadBatch);
+  }
+
+  private handleCurrentLoadError(seq: number, err: unknown): void {
+    if (seq !== this.currentLoadSeq) return;
+    const message = err instanceof Error ? err.message : String(err);
+    if (this.scope === "current") {
+      this.header.setStatusMessage({ type: "error", message: `Failed to load sessions: ${message}` }, 4000);
+      this.tuiRequestRender();
     }
   }
 
@@ -1131,6 +1257,9 @@ class FastResumePicker extends Container {
       for (const s of arr) {
         if (s.path === path) {
           s.name = name;
+          // #4 — name is part of the cached search blob; drop it so the next
+          // matchSession rebuilds with the new name.
+          invalidateSessionSearchText(s);
           updated = true;
         }
       }
@@ -1206,17 +1335,21 @@ async function showFastResumePicker(
 
   const t0 = Date.now();
 
-  // Load the current-scope sessions (and their metas) immediately. The
-  // current-scope stat is cheap (one dir); the all-dirs stat (~100ms at scale)
-  // is deferred off the first-paint critical path — the picker stats all dirs
-  // in the background before it starts the all-scope header load.
-  const { headers: currentSessions, metas: currentMetas } =
-    loadCurrentSessionsImmediate(cwd, sessionDir, usesDefaultSessionDir);
+  // #2 — Forward-load only the top-N most-recent current-scope sessions before
+  // first paint; the rest stream in from the background. The current-scope
+  // stat is cheap (one dir); the all-dirs stat (~100ms at scale) is deferred
+  // off the first-paint critical path — the picker stats all dirs in the
+  // background before it starts the all-scope header load.
+  const {
+    headers: currentSessions,
+    remaining: remainingCurrentMetas,
+    allMetas: currentMetas,
+  } = loadCurrentSessionsTopN(cwd, sessionDir, usesDefaultSessionDir, IMMEDIATE_CURRENT_COUNT);
 
   const loadTime = Date.now() - t0;
 
   ctx.ui.notify(
-    `Fast resume: ${currentSessions.length} current (all-scope loading in background) in ${loadTime}ms`,
+    `Fast resume: ${currentSessions.length} current${remainingCurrentMetas.length > 0 ? " (streaming)" : ""}, all-scope in background in ${loadTime}ms`,
     "info",
   );
 
@@ -1229,6 +1362,7 @@ async function showFastResumePicker(
         usesDefaultSessionDir,
         ctx.sessionManager.getSessionFile(),
         currentSessions,
+        remainingCurrentMetas,
         currentMetas,
         (result) => done(result),
         () => _tui.requestRender(),
