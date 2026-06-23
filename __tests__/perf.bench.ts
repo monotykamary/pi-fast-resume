@@ -28,12 +28,14 @@ import { bench, describe, beforeAll, afterAll, expect } from "vitest";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
+import { StringDecoder } from "node:string_decoder";
 import {
   scanAllSessionDirs,
   scanSessionDir,
   loadSessionHeadersForward,
   resolveSessionName,
   resolveSessionNamesDeferred,
+  scanTailForSessionInfo,
   canonicalizePath,
   clearCanonicalPathCache,
   sortByModified,
@@ -70,6 +72,7 @@ let mediumMetas: SessionFileMeta[]; // for the per-file bound micro-bench
 let consumedByPath: Map<string, number>; // path → forward consumedBytes (O(1) lookup for the bound micro-bench)
 let headerOnlyHeaders: SessionHeader[]; // forward reached EOF — the skip target
 let headerOnlyMetas: SessionFileMeta[];
+let denseTailBuf: Buffer; // #7 — a ~32KB tail dense with message lines + one session_info
 let samplePath: string; // a real file path for the per-call canonicalizePath micro-bench
 
 function genFile(
@@ -157,6 +160,18 @@ beforeAll(() => {
   headerOnlyHeaders = headers.filter((h) => h._fwdReachedEof);
   headerOnlyMetas = headerOnlyHeaders.map((h) => metaByPath.get(h.path)!).filter(Boolean);
   samplePath = allMetas[0]!.path;
+
+  // #7 — A dense tail (~32KB) of message lines + one session_info at EOF, the
+  // common renamed-large-file tail shape. The pre-filter skips parsing every
+  // message line; only the session_info line is parsed.
+  {
+    const lines: string[] = [];
+    while (Buffer.byteLength(lines.join("\n"), "utf8") < 32_000) {
+      lines.push(JSON.stringify({ type: "message", message: { role: "assistant", content: "reply ".repeat(20) } }));
+    }
+    lines.push(JSON.stringify({ type: "session_info", name: "Dense rename" }));
+    denseTailBuf = Buffer.from(lines.join("\n"));
+  }
 
   // Sanity: the corpus exercises every code path the optimizations touch.
   expect(allMetas.length, "corpus generated").toBeGreaterThan(0);
@@ -390,5 +405,65 @@ describe("#5 — background all-scope load (array management, ~12 batches)", () 
       // No per-batch sort or copy — reuse the growing ref (insertion order).
     }
     sortByModified(acc); // one final in-place sort at completion
+  }, { time: 1500 });
+});
+
+// --- #7: pre-filter before JSON.parse in the tail scan ------------------------
+// scanTailForSessionInfo parses every line in the (up to) 32KB tail looking for
+// session_info entries. ~all of those lines are messages. #7 adds a cheap
+// substring pre-filter (`"session_info"`) so message lines skip the full
+// JSON.parse. This is the deferred-rename-resolution hot path: called per
+// renamed file in the background drain.
+
+describe("#7 — tail scan pre-filter (dense message tail + 1 session_info)", () => {
+  // The OLD path: parse every line. Inlined here (mirroring the pre-#7
+  // scanTailForSessionInfo) so the bench can compare against the current
+  // (pre-filtered) export on the same buffer.
+  function scanTailNoPrefilter(buf: Buffer, bytesRead: number) {
+    const dec = new StringDecoder("utf8");
+    const text = dec.write(buf.subarray(0, bytesRead)) + dec.end();
+    let found = false;
+    let name: string | undefined;
+    for (const line of text.split("\n")) {
+      const trimmed = line.trim();
+      if (!trimmed) continue;
+      try {
+        const entry = JSON.parse(trimmed);
+        if (typeof entry === "object" && entry !== null && entry.type === "session_info") {
+          found = true;
+          name = entry.name?.trim() || undefined;
+        }
+      } catch {
+        // skip
+      }
+    }
+    return { found, name };
+  }
+
+  bench("[OLD] scanTailForSessionInfo  (JSON.parse every line)", () => {
+    scanTailNoPrefilter(denseTailBuf, denseTailBuf.length);
+  }, { time: 1500 });
+
+  bench("[NEW] scanTailForSessionInfo  (substring pre-filter skips messages)", () => {
+    scanTailForSessionInfo(denseTailBuf, denseTailBuf.length);
+  }, { time: 1500 });
+});
+
+// --- #8: Buffer.allocUnsafe for read buffers (skip the per-file zero-fill) ----
+// The forward + tail readers allocate a read buffer per file: Buffer.alloc
+// zero-fills it (safe but wasted — readSync overwrites [0, bytesRead) before
+// use). #8 uses Buffer.allocUnsafe, skipping a 16KB memset per file. With
+// ~2,577 files on the real corpus that's ~2,577 × 16KB of zeroing avoided.
+// This bench isolates the allocation cost (the only thing #8 changes).
+
+describe("#8 — read-buffer allocation (per file, × corpus size)", () => {
+  const ALLOC_COUNT = 2500; // ~the real corpus file count
+
+  bench("[OLD] Buffer.alloc(16KB) × 2500  (zero-fills each)", () => {
+    for (let i = 0; i < ALLOC_COUNT; i++) Buffer.alloc(16_384);
+  }, { time: 1500 });
+
+  bench("[NEW] Buffer.allocUnsafe(16KB) × 2500  (no zero-fill)", () => {
+    for (let i = 0; i < ALLOC_COUNT; i++) Buffer.allocUnsafe(16_384);
   }, { time: 1500 });
 });

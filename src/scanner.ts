@@ -251,6 +251,14 @@ export function scanTailForSessionInfo(
   for (const line of lines) {
     const trimmed = line.trim();
     if (!trimmed) continue;
+    // #7 — Cheap pre-filter: only session_info entries matter here, so skip
+    // JSON.parse for the (common) message lines without a full parse. The
+    // quoted marker is conservative — a message whose content literally
+    // contains "session_info" false-positives into one parse (harmless); a
+    // real session_info entry always carries it. Partial lines at the
+    // read-start boundary lack the marker and skip cheaply (JSON.parse would
+    // have thrown and been caught anyway).
+    if (!trimmed.includes('"session_info"')) continue;
     try {
       const entry = JSON.parse(trimmed);
       if (typeof entry === "object" && entry !== null && entry.type === "session_info") {
@@ -282,7 +290,10 @@ function forEachLineForward(
   onLine: (line: string) => boolean | void,
 ): { reachedEof: boolean; consumedBytes: number } {
   const decoder = new StringDecoder("utf8");
-  const chunk = Buffer.alloc(READ_CHUNK_SIZE);
+  // #8 — allocUnsafe: readSync fully overwrites [0, bytesRead) before the
+  // buffer is read (via decoder.write(subarray(0, bytesRead))), so the
+  // zero-fill of Buffer.alloc is wasted work. Skips a 16 KB memset per file.
+  const chunk = Buffer.allocUnsafe(READ_CHUNK_SIZE);
   let lineBuf = "";
   let offset = 0;
   let consumedBytes = 0;
@@ -480,7 +491,8 @@ export function resolveSessionName(
   let fd: number | undefined;
   try {
     fd = openSync(meta.path, "r");
-    const tailBuf = Buffer.alloc(tailReadSize);
+    // #8 — allocUnsafe: readSync overwrites [0, bytesRead) before use.
+    const tailBuf = Buffer.allocUnsafe(tailReadSize);
     const tailOffset = meta.size - tailReadSize;
     const tailBytesRead = readSync(fd, tailBuf, 0, tailReadSize, tailOffset);
     return scanTailForSessionInfo(tailBuf, tailBytesRead);
@@ -545,7 +557,8 @@ export function loadSessionHeader(
     if (!forwardReachedEof) {
       try {
         const tailReadSize = Math.min(TAIL_READ_SIZE, meta.size - consumedBytes);
-        const tailBuf = Buffer.alloc(tailReadSize);
+        // #8 — allocUnsafe: readSync overwrites [0, bytesRead) before use.
+        const tailBuf = Buffer.allocUnsafe(tailReadSize);
         const tailOffset = meta.size - tailReadSize;
         const tailBytesRead = readSync(fd, tailBuf, 0, tailReadSize, tailOffset);
         tailInfo = scanTailForSessionInfo(tailBuf, tailBytesRead);

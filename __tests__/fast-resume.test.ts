@@ -1093,6 +1093,61 @@ describe("scanTailForSessionInfo", () => {
     expect(result.found).toBe(true);
     expect(result.name).toBe("Found after partial");
   });
+
+  // #7 — the pre-filter skips JSON.parse for lines without the "session_info"
+  // marker. These tests pin its edge cases so a future change can't regress
+  // the tail scan's correctness for the inputs the pre-filter handles.
+  it("#7 pre-filter: finds session_info amid many message lines (no false skip)", () => {
+    // A dense tail of message lines (the common case) + one session_info at
+    // EOF. The pre-filter skips parsing every message line; the session_info
+    // is still found.
+    const lines: string[] = [];
+    for (let i = 0; i < 40; i++) {
+      lines.push(JSON.stringify({ type: "message", message: { role: i % 2 ? "user" : "assistant", content: `reply ${i}` } }));
+    }
+    lines.push(JSON.stringify({ type: "session_info", name: "Dense rename" }));
+    const buf = Buffer.from(lines.join("\n"));
+    const result = scanTailForSessionInfo(buf, buf.length);
+    expect(result.found).toBe(true);
+    expect(result.name).toBe("Dense rename");
+  });
+
+  it("#7 pre-filter: a message whose CONTENT contains the marker still doesn't match", () => {
+    // A message whose text literally contains "session_info" false-positives
+    // the substring pre-filter into one JSON.parse, which then finds
+    // type !== "session_info" and skips it. No false match.
+    const tail = [
+      JSON.stringify({ type: "message", message: { role: "user", content: 'discussing "session_info" entries' } }),
+      JSON.stringify({ type: "session_info", name: "Real rename" }),
+    ].join("\n");
+    const buf = Buffer.from(tail);
+    const result = scanTailForSessionInfo(buf, buf.length);
+    expect(result.found).toBe(true);
+    expect(result.name).toBe("Real rename");
+  });
+
+  it("#7 pre-filter: handles whitespace variance in the type field", () => {
+    // JSON may serialize as "type": "session_info" (with a space). The
+    // quoted-marker pre-filter must still let it through to the parse.
+    const tail = '{"type": "session_info", "name": "Spaced"}\n';
+    const buf = Buffer.from(tail);
+    const result = scanTailForSessionInfo(buf, buf.length);
+    expect(result.found).toBe(true);
+    expect(result.name).toBe("Spaced");
+  });
+
+  it("#7 pre-filter: returns found:false for an all-message tail without parsing past the first non-matching check", () => {
+    // No session_info anywhere → found:false. (Behavior is unchanged vs the
+    // pre-#7 path; this pins it so the pre-filter is never blamed for a miss.)
+    const lines: string[] = [];
+    for (let i = 0; i < 30; i++) {
+      lines.push(JSON.stringify({ type: "message", message: { role: "assistant", content: `msg ${i}` } }));
+    }
+    const buf = Buffer.from(lines.join("\n"));
+    const result = scanTailForSessionInfo(buf, buf.length);
+    expect(result.found).toBe(false);
+    expect(result.name).toBeUndefined();
+  });
 });
 
 describe("loadSessionHeader tail read (session_info at EOF)", () => {
