@@ -430,6 +430,15 @@ class FastResumeSessionList implements Component {
     this.filterSessions(this.searchInput.getValue());
   }
 
+  // #5 — Drop the threaded-tree cache so the next filterSessions rebuilds it.
+  // The background loads reuse one growing session array (same ref) and append
+  // batches in place; without invalidation the ref-keyed cache would hit and
+  // serve a stale tree missing the new rows. Call before setSessions whenever
+  // the array's CONTENT changed but its REFERENCE did not.
+  invalidateTreeCache(): void {
+    this._treeCache = null;
+  }
+
   setConfirmingDeletePath(path: string | null): void {
     this.confirmingDeletePath = path;
     this.onDeleteConfirmationChange?.(path);
@@ -1020,17 +1029,27 @@ class FastResumePicker extends Container {
     setImmediate(() => this.runCurrentLoadHeaders(seq, sorted));
   }
 
+  // #5 — Background current-scope load. Seeds the accumulator with a snapshot
+  // of the top-N immediate headers (one copy, ~30 elements), appends each
+  // batch's cwd-filtered headers in place (no per-batch array copy or re-sort),
+  // and sorts once at completion. Reuses one growing array ref for display, so
+  // the threaded-tree cache is invalidated before each setSessions to rebuild
+  // with the new rows. Intermediate order is insertion order ≈ mtime desc
+  // (batches arrive pre-sorted by mtime). Fixes the prior per-batch
+  // merge that duplicated earlier batches' headers.
   private runCurrentLoadHeaders(seq: number, sorted: SessionFileMeta[]): void {
     const BATCH_SIZE = 50;
     let offset = 0;
-    const parsed: SessionHeader[] = [];
+    // Seed with a copy of the immediate top-N headers so appending batches
+    // can't mutate the list's current array out from under a prior render, and
+    // so the accumulator owns its storage independently.
+    const acc: SessionHeader[] = (this.currentSessions ?? []).slice();
 
-    const mergeAndShow = () => {
-      let merged = [...(this.currentSessions ?? []), ...parsed];
-      if (!this.usesDefaultSessionDir) merged = filterByCwd(merged, this.cwd);
-      this.currentSessions = sortByModified(merged);
+    const show = () => {
+      this.currentSessions = acc;
       if (this.scope === "current") {
-        this.sessionList.setSessions(this.currentSessions, false);
+        this.sessionList.invalidateTreeCache();
+        this.sessionList.setSessions(acc, false);
         this.tuiRequestRender();
       }
     };
@@ -1042,7 +1061,8 @@ class FastResumePicker extends Container {
       const batch = sorted.slice(offset, offset + BATCH_SIZE);
       if (batch.length === 0) {
         this.currentLoading = false;
-        mergeAndShow();
+        sortByModified(acc); // final sort in place (sortByModified returns acc)
+        show();
         return;
       }
 
@@ -1055,9 +1075,10 @@ class FastResumePicker extends Container {
         return;
       }
 
-      parsed.push(...headers);
+      if (!this.usesDefaultSessionDir) headers = filterByCwd(headers, this.cwd);
+      acc.push(...headers);
       this.enqueueNameResolution(headers);
-      mergeAndShow();
+      show();
 
       offset += BATCH_SIZE;
       setImmediate(loadBatch);
@@ -1114,6 +1135,12 @@ class FastResumePicker extends Container {
   // Phase 2: forward-load all-scope headers in cooperative batches of 50,
   // enqueuing each batch for background rename-name resolution. Updates the
   // active list + progress only while the user is viewing "all" scope.
+  // #5 — Background all-scope header load. Appends each batch into a single
+  // growing array (no per-batch array copy or re-sort) and sorts once at
+  // completion. Reuses one array ref for display, so the threaded-tree cache
+  // is invalidated before each setSessions to rebuild with the new rows.
+  // Intermediate order is insertion order ≈ mtime desc (batches arrive
+  // pre-sorted by mtime; the threaded tree re-sorts internally regardless).
   private runAllLoadHeaders(seq: number, sorted: SessionFileMeta[]): void {
     const BATCH_SIZE = 50;
     let offset = 0;
@@ -1131,11 +1158,12 @@ class FastResumePicker extends Container {
       const batch = sorted.slice(offset, offset + BATCH_SIZE);
       if (batch.length === 0) {
         this.allLoading = false;
-        this.allSessions = sortByModified(allParsed);
+        this.allSessions = sortByModified(allParsed); // final sort in place
 
         // If we're currently showing "all" scope, update the list
         if (this.scope === "all") {
           this.header.loading = false;
+          this.sessionList.invalidateTreeCache();
           this.sessionList.setSessions(this.allSessions, true);
           this.tuiRequestRender();
 
@@ -1166,10 +1194,13 @@ class FastResumePicker extends Container {
       // in the active list.
       this.enqueueNameResolution(headers);
 
-      // If we're currently showing "all" scope, update progress
+      // If we're currently showing "all" scope, update progress. Reuse the
+      // growing allParsed ref (insertion order ≈ mtime desc); invalidate the
+      // tree cache so it rebuilds with the appended rows.
       if (this.scope === "all") {
         this.header.loadProgress = { loaded: allParsed.length, total: sorted.length };
-        this.allSessions = sortByModified([...allParsed]);
+        this.allSessions = allParsed;
+        this.sessionList.invalidateTreeCache();
         this.sessionList.setSessions(this.allSessions, true);
         this.tuiRequestRender();
       }

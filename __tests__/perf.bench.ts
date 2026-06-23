@@ -36,6 +36,7 @@ import {
   resolveSessionNamesDeferred,
   canonicalizePath,
   clearCanonicalPathCache,
+  sortByModified,
   type SessionFileMeta,
   type SessionHeader,
 } from "../src/scanner.js";
@@ -356,5 +357,38 @@ describe("#4 — threaded-tree cache (50 name-resolution batches)", () => {
     for (let i = 1; i < 50; i++) {
       // reuse cached flat: no build work — mirrors the picker's cache hit
     }
+  }, { time: 1500 });
+});
+
+// --- #5: no per-batch re-sort + array copy in the background loads -----------
+// The pre-#5 background loads did `sortByModified([...allParsed])` per 50-file
+// batch — an O(n) array copy + O(n log n) sort on the main-thread setImmediate
+// queue, ~52 times across a 2,577-file all-scope load. #5 appends batches into
+// one growing array (no copy, no sort) and sorts once at completion. This
+// bench isolates the array-management cost (sort + copy) from the I/O, which is
+// identical in both. The tree-rebuild-per-batch cost is the same in both (the
+// ref-keyed tree cache is invalidated/misses either way), so it's excluded.
+
+describe("#5 — background all-scope load (array management, ~12 batches)", () => {
+  const BATCH = 50;
+  // `headers` is read inside each bench closure at run time (after beforeAll
+  // populates it), not captured at describe-collection time.
+
+  bench("[OLD] per-batch sort+copy  (sortByModified([...acc]) each batch)", () => {
+    const acc: SessionHeader[] = [];
+    for (let off = 0; off < headers.length; off += BATCH) {
+      acc.push(...headers.slice(off, off + BATCH));
+      // The pre-#5 per-batch work: copy the growing array + re-sort it.
+      sortByModified([...acc]);
+    }
+  }, { time: 1500 });
+
+  bench("[NEW] append in place + 1 final sort  (no per-batch copy/sort)", () => {
+    const acc: SessionHeader[] = [];
+    for (let off = 0; off < headers.length; off += BATCH) {
+      acc.push(...headers.slice(off, off + BATCH));
+      // No per-batch sort or copy — reuse the growing ref (insertion order).
+    }
+    sortByModified(acc); // one final in-place sort at completion
   }, { time: 1500 });
 });
