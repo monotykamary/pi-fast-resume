@@ -43,7 +43,7 @@
  * tradeoff is by design — the fast load time depends on partial reads.
  */
 
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
+import { getAgentDir, type ExtensionAPI, type ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
 import type { KeyId } from "@earendil-works/pi-tui";
 import {
   DynamicBorder,
@@ -114,7 +114,7 @@ interface FastResumeConfig {
   shortcut?: string;
 }
 
-const CONFIG_PATH = join(HOME, ".pi", "agent", "extensions", "pi-fast-resume.json");
+const CONFIG_PATH = join(getAgentDir(), "extensions", "pi-fast-resume.json");
 
 function readConfig(): FastResumeConfig {
   try {

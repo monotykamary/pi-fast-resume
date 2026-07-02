@@ -1,7 +1,7 @@
 import { openSync, readSync, closeSync, readdirSync, statSync, realpathSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { homedir } from "node:os";
 import { StringDecoder } from "node:string_decoder";
+import { getAgentDir } from "@earendil-works/pi-coding-agent";
 
 export interface SessionHeader {
   path: string;
@@ -337,8 +337,7 @@ function forEachLineForward(
   return { reachedEof: true, consumedBytes };
 }
 
-const HOME = homedir();
-const DEFAULT_SESSIONS_DIR = join(HOME, ".pi", "agent", "sessions");
+const DEFAULT_SESSIONS_DIR = join(getAgentDir(), "sessions");
 
 /**
  * Scan ALL session directories under the root (~/.pi/agent/sessions/).
