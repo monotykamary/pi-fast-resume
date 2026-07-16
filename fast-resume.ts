@@ -1384,6 +1384,22 @@ async function showFastResumePicker(
     "info",
   );
 
+  if (ctx.mode !== "tui") {
+    if (!ctx.hasUI) return;
+    if (currentSessions.length === 0) {
+      ctx.ui.notify("No sessions found to resume.", "info");
+      return;
+    }
+    const items = currentSessions.map((h) => `${h.name ?? h.firstMessage} (${formatSessionDate(h.modified)})`);
+    const pick = await ctx.ui.select("Fast resume \u2014 pick a session", items);
+    if (pick === undefined) return;
+    const idx = items.indexOf(pick);
+    if (idx < 0) return;
+    const session = currentSessions[idx];
+    if (session) await ctx.switchSession(session.path);
+    return;
+  }
+
   const result = await ctx.ui.custom<FastResumeResult>(
     (_tui, theme, _kb, done) => {
       const picker = new FastResumePicker(
