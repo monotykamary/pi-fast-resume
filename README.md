@@ -264,3 +264,9 @@ All other features — tree view, regex/exact-phrase search, sort modes, scope t
 ## License
 
 [MIT](./LICENSE)
+
+## Pi 0.99 compatibility (1.4.14)
+
+Selector and shortcut patches now activate only in live TUI sessions, reinstall after session replacement, and compose safely with other picker wrappers. The native 0.99 selector/shortcut method contracts and actual loading were verified.
+
+Tested with Pi 0.99.0. Host-provided Pi packages are wildcard peers, not bundled dependencies; development uses exact 0.99.0 versions.

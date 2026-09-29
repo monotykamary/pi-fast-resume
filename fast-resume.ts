@@ -1425,164 +1425,53 @@ async function showFastResumePicker(
   }
 }
 
-// Stored reference to the extension runner, captured via prototype patch on
-// InteractiveMode.prototype.setupExtensionShortcuts. Used by the shortcut
-// handler to create an ExtensionCommandContext with switchSession(), since
-// pi.registerShortcut handlers only receive ExtensionContext.
-let storedExtensionRunner: any = null;
-
-// Reference to the original showSessionSelector, saved before patching
-let origShowSessionSelector: ((this: InteractiveMode) => void) | null = null;
-
-// Reference to the original setupExtensionShortcuts, saved before patching
-let origSetupExtensionShortcuts: Function | null = null;
-
-function patchSetupExtensionShortcuts(): void {
-  if (origSetupExtensionShortcuts !== null) return; // Already patched
-  const proto = InteractiveMode.prototype as any;
-  if (
-    !InteractiveMode ||
-    typeof InteractiveMode !== "function" ||
-    typeof proto.setupExtensionShortcuts !== "function"
-  ) {
-    return;
-  }
-  origSetupExtensionShortcuts = proto.setupExtensionShortcuts;
-  proto.setupExtensionShortcuts = function (
-    this: InteractiveMode,
-    extensionRunner: any,
-  ) {
-    storedExtensionRunner = extensionRunner;
-    origSetupExtensionShortcuts!.call(this, extensionRunner);
-  };
-}
-
-function unpatchSetupExtensionShortcuts(): void {
-  if (origSetupExtensionShortcuts === null) return;
-  const proto = InteractiveMode.prototype as any;
-  if (
-    InteractiveMode &&
-    typeof InteractiveMode === "function" &&
-    typeof proto.setupExtensionShortcuts === "function"
-  ) {
-    proto.setupExtensionShortcuts = origSetupExtensionShortcuts;
-  }
-  origSetupExtensionShortcuts = null;
-  storedExtensionRunner = null;
-}
-
-function installResumeHijack(): void {
-  if (origShowSessionSelector !== null) return; // Already patched
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- prototype patching requires any cast for private access
-  const proto = InteractiveMode.prototype as any;
-  if (
-    !InteractiveMode ||
-    typeof InteractiveMode !== "function" ||
-    typeof proto.showSessionSelector !== "function"
-  ) {
-    return; // Guard: API changed or not available
-  }
-  origShowSessionSelector = proto.showSessionSelector;
-  proto.showSessionSelector = function (this: InteractiveMode) {
-    // Try to get an ExtensionCommandContext from the running session's extension runner
-    const session = (this as any).session;
-    if (!session?.extensionRunner?.createCommandContext) {
-      // Fallback to original if we can't get a command context
-      origShowSessionSelector!.call(this);
-      return;
-    }
-    const ctx = session.extensionRunner.createCommandContext() as ExtensionCommandContext;
-    // Fire-and-forget — same pattern as the original (synchronous, UI appears immediately)
-    void showFastResumePicker(ctx);
-  };
-}
-
-function uninstallResumeHijack(): void {
-  if (origShowSessionSelector === null) return;
-  // eslint-disable-next-line @typescript-eslint/no-explicit-any -- prototype patching requires any cast for private access
-  const proto = InteractiveMode.prototype as any;
-  if (
-    InteractiveMode &&
-    typeof InteractiveMode === "function" &&
-    typeof proto.showSessionSelector === "function"
-  ) {
-    proto.showSessionSelector = origShowSessionSelector;
-  }
-  origShowSessionSelector = null;
-}
+import { installInteractivePatch } from "./src/interactive-patch.js";
 
 export default function (pi: ExtensionAPI) {
   const config = readConfig();
-  const hijackResume = config.hijackResume !== false;
+  const hijack = config.hijackResume !== false;
+  let runner: { createCommandContext(): ExtensionCommandContext } | undefined;
+  let restores: Array<() => void> = [];
 
-  if (hijackResume) {
-    // Hijack /resume — replace the built-in session selector with our fast picker
-    installResumeHijack();
-    // Don't register /fast-resume — /resume already opens the fast picker
-  } else {
-    // Normal mode — register /fast-resume as a standalone command
-    pi.registerCommand("fast-resume", {
-      description: "Fast session resume — instant picker with incremental loading",
-      getArgumentCompletions: (prefix: string) => {
-        if (!prefix) return null;
-        return [{ value: prefix, label: `Search: ${prefix}` }];
-      },
-      handler: async (args, ctx) => {
-        const query = args?.trim() || undefined;
-        await showFastResumePicker(ctx, query);
-      },
-    });
-  }
+  // Pi 0.99 binds session_start before setupExtensionShortcuts, including
+  // session replacement. Factories loaded for discovery must not patch the UI.
+  pi.on("session_start", (_event, ctx) => {
+    if (ctx.mode !== "tui" || restores.length) return;
+    try {
+      if (hijack) restores.push(installInteractivePatch(InteractiveMode.prototype, "showSessionSelector", function (original, ...args) {
+        const currentRunner = this.session?.extensionRunner;
+        if (!currentRunner?.createCommandContext) return original.apply(this, args);
+        return showFastResumePicker(currentRunner.createCommandContext()).catch((error: unknown) => {
+          ctx.ui.notify(`Fast resume: ${String(error)}`, "error");
+        });
+      }));
+      if (config.shortcut) restores.push(installInteractivePatch(InteractiveMode.prototype, "setupExtensionShortcuts", function (original, extensionRunner) {
+        runner = extensionRunner;
+        return original.call(this, extensionRunner);
+      }));
+    } catch (error) {
+      for (const restore of restores.reverse()) restore();
+      restores = [];
+      ctx.ui.notify(String(error), "warning");
+    }
+  });
 
-  // Register a standalone keyboard shortcut for the fast resume picker.
-  // pi.registerShortcut handlers receive ExtensionContext (no switchSession),
-  // so we capture the extension runner via a prototype patch on
-  // InteractiveMode.prototype.setupExtensionShortcuts and use it to create
-  // an ExtensionCommandContext inside the handler.
-  //
-  // Users can rebind the key via pi-fast-resume.json:
-  //   { "shortcut": "alt+u" }
-  //
-  // In hijack mode, app.session.resume also opens the fast picker (rebindable
-  // in ~/.pi/agent/keybindings.json). The shortcut config is an additional
-  // independent binding that does not override the built-in /resume.
-  const shortcut = config.shortcut;
-  if (shortcut) {
-    // Patch setupExtensionShortcuts so we can capture the extension runner.
-    // This runs before setupExtensionShortcuts is called (during extension
-    // load, which precedes the shortcut setup phase).
-    patchSetupExtensionShortcuts();
-
-    pi.registerShortcut(shortcut as KeyId, {
-      description: "Fast session resume",
-      handler: async (ctx) => {
-        // Use the stored extension runner to get a full command context
-        // with switchSession(), since the shortcut handler ctx (ExtensionContext)
-        // does not include session-switching methods.
-        if (
-          !storedExtensionRunner ||
-          typeof storedExtensionRunner.createCommandContext !== "function"
-        ) {
-          ctx.ui.notify(
-            "Fast resume shortcut: extension runner not available. Try reloading with /reload.",
-            "error",
-          );
-          return;
-        }
-        const cmdCtx =
-          storedExtensionRunner.createCommandContext() as ExtensionCommandContext;
-        await showFastResumePicker(cmdCtx);
-      },
-    });
-  }
-
-  // Clean up prototype patches on session shutdown (reload, quit, session switch)
+  if (!hijack) pi.registerCommand("fast-resume", {
+    description: "Fast session resume",
+    getArgumentCompletions: (prefix: string) => prefix ? [{ value: prefix, label: `Search: ${prefix}` }] : null,
+    handler: async (args, ctx) => { await showFastResumePicker(ctx, args?.trim() || undefined); },
+  });
+  if (config.shortcut) pi.registerShortcut(config.shortcut as KeyId, {
+    description: "Fast session resume",
+    handler: async (ctx) => {
+      if (ctx.mode !== "tui") return;
+      if (!runner) { ctx.ui.notify("Fast resume: session shortcuts are not bound", "error"); return; }
+      await showFastResumePicker(runner.createCommandContext());
+    },
+  });
   pi.on("session_shutdown", () => {
-    if (hijackResume) {
-      uninstallResumeHijack();
-    }
-    if (shortcut) {
-      unpatchSetupExtensionShortcuts();
-    }
+    for (const restore of restores.reverse()) restore();
+    restores = [];
+    runner = undefined;
   });
 }
