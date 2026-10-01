@@ -265,6 +265,13 @@ All other features — tree view, regex/exact-phrase search, sort modes, scope t
 
 [MIT](./LICENSE)
 
+## Pi 1.0 compatibility (1.4.15)
+
+Tested against Pi **1.0.0** with exact SDK development pins and wildcard host peers.
+The live mapped InteractiveMode opens the fast picker and restores its selector hook on shutdown.
+
+Run `bun run test:host` for the offline real-host regression. Set `PI1_HOST_PACKAGE` to an installed Pi package directory and `PI1_HOST_ENTRY=bundle` to test its bundled CLI runtime.
+
 ## Pi 0.99 compatibility (1.4.14)
 
 Selector and shortcut patches now activate only in live TUI sessions, reinstall after session replacement, and compose safely with other picker wrappers. The native 0.99 selector/shortcut method contracts and actual loading were verified.

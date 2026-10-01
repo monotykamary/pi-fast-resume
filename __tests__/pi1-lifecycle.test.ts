@@ -3,7 +3,7 @@ import { InteractiveMode } from "@earendil-works/pi-coding-agent";
 import extension from "../fast-resume.js";
 import { installInteractivePatch } from "../src/interactive-patch.js";
 
-describe("Pi 0.99 picker patch lifecycle", () => {
+describe("Pi 1.0 picker patch lifecycle", () => {
   it("patches only a live TUI and reinstalls after session replacement", () => {
     const handlers = new Map<string, any>();
     const proto = InteractiveMode.prototype as any;
