@@ -267,7 +267,7 @@ All other features — tree view, regex/exact-phrase search, sort modes, scope t
 
 ## Pi 1.0 compatibility (1.4.15)
 
-Tested against Pi **1.0.0** with exact SDK development pins and wildcard host peers.
+Tested against Pi **1.1.0** with exact SDK development pins and wildcard host peers.
 The live mapped InteractiveMode opens the fast picker and restores its selector hook on shutdown.
 
 Run `bun run test:host` for the offline real-host regression. Set `PI1_HOST_PACKAGE` to an installed Pi package directory and `PI1_HOST_ENTRY=bundle` to test its bundled CLI runtime.
