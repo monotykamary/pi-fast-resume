@@ -20,11 +20,12 @@
  *   When enabled, /resume and Ctrl+Shift+R open the fast picker instead.
  *   /fast-resume is not registered (no duplicate). pi -r is not affected.
  *
- * Keys in picker (identical to /resume):
+ * Keys in picker (built-in controls plus parent-thread filtering):
  *   ↑/↓                   Navigate
  *   Tab                   Toggle scope (Current Folder / All)
  *   Ctrl+S                Toggle sort (Threaded / Recent / Fuzzy)
  *   Ctrl+N                Toggle name filter (All / Named)
+ *   Ctrl+O                Toggle parent threads only
  *   Ctrl+P                Toggle session path display
  *   Ctrl+D                Delete session (with confirmation)
  *   Ctrl+R                Rename session
@@ -58,6 +59,7 @@ import {
   type Component,
   getKeybindings,
   Input,
+  matchesKey,
   Spacer,
   Text,
   truncateToWidth,
@@ -246,6 +248,7 @@ class FastResumeHeader implements Component {
   scope: PickerScope = "current";
   sortMode: SortMode = "threaded";
   nameFilter: NameFilter = "all";
+  parentsOnly = false;
   loading = false;
   loadProgress: { loaded: number; total: number } | null = null;
   showPath = false;
@@ -326,7 +329,8 @@ class FastResumeHeader implements Component {
     } else {
       const pathState = this.showPath ? "(on)" : "(off)";
       const sep = t.fg("muted", " · ");
-      const hint1 = keyHint("tui.input.tab", "scope") + sep + t.fg("muted", 're:<pattern> regex · "phrase" exact');
+      const parentHint = `Ctrl+O parents only (${this.parentsOnly ? "on" : "off"})`;
+      const hint1 = t.fg("muted", parentHint) + sep + keyHint("tui.input.tab", "scope") + sep + t.fg("muted", 're:<pattern> regex · "phrase" exact');
       const hint2Parts = [
         keyHint("app.session.toggleSort", "sort"),
         keyHint("app.session.toggleNamedFilter", "named"),
@@ -362,6 +366,7 @@ class FastResumeSessionList implements Component {
   showPath = false;
   sortMode: SortMode = "threaded";
   nameFilter: NameFilter = "all";
+  parentsOnly = false;
   confirmingDeletePath: string | null = null;
   maxVisible = 10;
 
@@ -370,11 +375,11 @@ class FastResumeSessionList implements Component {
   // load), and the session set — NOT on `name`. So a tree built for a given
   // session-array reference stays valid across in-place name mutations (rename
   // resolution) and across query typing/clearing, as long as the array ref is
-  // stable. Keyed on the `nameFilter==="all"` array (=== this.allSessions);
+  // stable. Keyed on the all-sessions array plus the parent-only filter;
   // the "named" subset depends on names and is never cached. setSessions passes
   // a new ref on load/scope/mutation (cache misses → rebuild) and the same ref
   // on name-resolution batches (cache hits → skip rebuild).
-  private _treeCache: { sessionsRef: SessionHeader[]; flat: FlatSessionNode[] } | null = null;
+  private _treeCache: { sessionsRef: SessionHeader[]; parentsOnly: boolean; flat: FlatSessionNode[] } | null = null;
   currentSessionCanonicalPath: string | undefined;
 
   onSelect?: (sessionPath: string) => void;
@@ -383,6 +388,7 @@ class FastResumeSessionList implements Component {
   onToggleScope?: () => void;
   onToggleSort?: () => void;
   onToggleNameFilter?: () => void;
+  onToggleParentsOnly?: () => void;
   onTogglePath?: (showPath: boolean) => void;
   onDeleteConfirmationChange?: (path: string | null) => void;
   onDeleteSession?: (sessionPath: string) => void;
@@ -424,6 +430,14 @@ class FastResumeSessionList implements Component {
     this.filterSessions(this.searchInput.getValue());
   }
 
+  setParentsOnly(parentsOnly: boolean): void {
+    const selectedPath = this.getSelectedSessionPath();
+    this.parentsOnly = parentsOnly;
+    this.filterSessions(this.searchInput.getValue());
+    const retainedIndex = this.filteredNodes.findIndex((node) => node.session.path === selectedPath);
+    this.selectedIndex = retainedIndex >= 0 ? retainedIndex : 0;
+  }
+
   setSessions(sessions: SessionHeader[], showCwd: boolean): void {
     this.allSessions = sessions;
     this.showCwd = showCwd;
@@ -460,25 +474,30 @@ class FastResumeSessionList implements Component {
   }
 
   filterSessions(query: string): void {
+    // Use header ancestry, not visible tree depth: an orphan or out-of-scope
+    // child is still a child. No additional session-file reads are needed.
+    const parentFiltered = this.parentsOnly
+      ? this.allSessions.filter((session) => !session.parentSessionPath)
+      : this.allSessions;
     const nameFiltered = this.nameFilter === "all"
-      ? this.allSessions
-      : this.allSessions.filter(hasSessionName);
+      ? parentFiltered
+      : parentFiltered.filter(hasSessionName);
 
     const trimmed = query.trim();
 
     if (this.sortMode === "threaded" && !trimmed) {
-      // Threaded mode without search: show tree structure. Cache it when the
-      // nameFiltered array is the stable all-sessions ref (nameFilter==="all")
-      // — the tree doesn't depend on names, so it survives in-place name
+      // Threaded mode without search: show tree structure. Cache by the
+      // stable source array and parent-only mode when nameFilter==="all".
+      // The tree does not depend on names, so it survives in-place name
       // mutations and query typing/clearing until the session set changes.
-      const canCache = this.nameFilter === "all"; // nameFiltered === this.allSessions
-      if (canCache && this._treeCache !== null && this._treeCache.sessionsRef === nameFiltered) {
+      const canCache = this.nameFilter === "all";
+      if (canCache && this._treeCache !== null && this._treeCache.sessionsRef === this.allSessions && this._treeCache.parentsOnly === this.parentsOnly) {
         this.filteredNodes = this._treeCache.flat;
       } else {
         const roots = buildSessionTree(nameFiltered);
         const flat = flattenSessionTree(roots);
         this.filteredNodes = flat;
-        if (canCache) this._treeCache = { sessionsRef: nameFiltered, flat };
+        if (canCache) this._treeCache = { sessionsRef: this.allSessions, parentsOnly: this.parentsOnly, flat };
       }
     } else {
       // Other modes or with search: flat list via filterAndSortSessions. Leave
@@ -513,7 +532,9 @@ class FastResumeSessionList implements Component {
 
     if (this.filteredNodes.length === 0) {
       let emptyMessage: string;
-      if (this.nameFilter === "named") {
+      if (this.parentsOnly) {
+        emptyMessage = "  No matching parent threads. Ctrl+O shows child threads too.";
+      } else if (this.nameFilter === "named") {
         const toggleKey = keyText("app.session.toggleNamedFilter");
         if (this.showCwd) {
           emptyMessage = `  No named sessions found. Press ${toggleKey} to show all.`;
@@ -692,6 +713,9 @@ class FastResumeSessionList implements Component {
       }
     } else if (kb.matches(data, "tui.select.cancel")) {
       this.onCancel?.();
+    } else if (matchesKey(data, "ctrl+o")) {
+      // Picker-local shortcut; existing configurable session actions take priority.
+      this.onToggleParentsOnly?.();
     } else {
       // Pass everything else to search input
       this.searchInput.handleInput(data);
@@ -841,6 +865,11 @@ class FastResumePicker extends Container {
     this.sessionList.onToggleScope = () => this.toggleScope();
     this.sessionList.onToggleSort = () => this.toggleSortMode();
     this.sessionList.onToggleNameFilter = () => this.toggleNameFilter();
+    this.sessionList.onToggleParentsOnly = () => {
+      this.sessionList.setParentsOnly(!this.sessionList.parentsOnly);
+      this.header.parentsOnly = this.sessionList.parentsOnly;
+      this.tuiRequestRender();
+    };
     this.sessionList.onTogglePath = (showPath) => {
       this.header.showPath = showPath;
       this.tuiRequestRender();
