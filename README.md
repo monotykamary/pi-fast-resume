@@ -22,7 +22,7 @@ Same picker UI and standard keybindings as `/resume`, plus a parent-thread-only 
 ──────────────────────────────────────────────────────────
 
 Resume Session (Current Folder)       ◉ Current Folder | ○ All  Name: All  Sort: Threaded
-Ctrl+O parents only (off) · Tab scope · re:<pattern> regex · "phrase" exact
+Ctrl+o parents only (off) · Tab scope · re:<pattern> regex · "phrase" exact
 Ctrl+S sort · Ctrl+N named · Ctrl+D delete · Ctrl+P path (off) · Ctrl+R rename
 
 search: fix auth bug_
@@ -67,8 +67,6 @@ Tested with **1,771 sessions, 1.46 GB** of JSONL data on disk.
 </details>
 
 ## Install
-
-For this fork's parent-thread shortcut, use `git:github.com/AHGGG/pi-fast-resume@main` in your Pi packages instead of `npm:pi-fast-resume`. Do not load both copies. The installation examples below refer to the upstream package.
 
 **With `pi install`** (recommended):
 
@@ -155,7 +153,7 @@ Built-in `/resume` controls, plus a parent-thread filter:
 | `Tab`        | Toggle scope — current project ↔ all sessions |
 | `Ctrl+S`     | Toggle sort — Threaded / Recent / Fuzzy       |
 | `Ctrl+N`     | Toggle name filter — All / Named              |
-| `Ctrl+O`     | Toggle parent threads only                    |
+| `Ctrl+o`     | Toggle parent threads only                    |
 | `Ctrl+P`     | Toggle session file path display              |
 | `Ctrl+D`     | Delete selected session (with confirmation)   |
 | `Ctrl+R`     | Rename selected session                       |
@@ -163,9 +161,9 @@ Built-in `/resume` controls, plus a parent-thread filter:
 
 ### Parent threads only
 
-Press **Ctrl+O** in the picker to hide child/forked sessions. Press it again to show all threads. The hint shows whether the filter is on. Parent threads are sessions with no `parentSession` in their header, including standalone sessions; a child remains hidden even if its parent is missing or outside the current scope. Sessions without ancestry metadata cannot be identified as children.
+Press **Ctrl+o** in the picker to hide child/forked sessions. Press it again to show all threads. The hint shows whether the filter is on. Parent threads are sessions with no `parentSession` in their header, including standalone sessions; a child remains hidden even if its parent is missing or outside the current scope. Sessions without ancestry metadata cannot be identified as children.
 
-The filter works together with search, named-only filtering, sorting, and both scopes. It stays active while rows load and resets when you reopen the picker. Existing configured session shortcuts take priority if rebound to Ctrl+O.
+The filter works together with search, named-only filtering, sorting, and both scopes. It stays active while rows load and resets when you reopen the picker. Existing configured session shortcuts take priority if rebound to Ctrl+o.
 
 ### Scope
 
