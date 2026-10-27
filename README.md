@@ -16,13 +16,13 @@ _Reads just enough of each file to show the title row — first results in **6ms
 > **`/resume` takes 5.6 seconds** when you have 1,700+ sessions.
 > pi-fast-resume's `/fast-resume` takes **6 milliseconds**.
 
-Same picker UI and keybindings as `/resume`. The difference is pi-fast-resume never parses the full JSONL. For each file it streams complete lines forward just until the first user message (the title), then reads a bounded tail near EOF to recover the latest session name (which pi appends on `/rename`). Everything between is full message history the picker never shows. Search matches against the first message only (see [Known Limitations](#known-limitations)).
+Same picker UI and standard keybindings as `/resume`, plus a parent-thread-only toggle. The difference is pi-fast-resume never parses the full JSONL. For each file it streams complete lines forward just until the first user message (the title), then reads a bounded tail near EOF to recover the latest session name (which pi appends on `/rename`). Everything between is full message history the picker never shows. Search matches against the first message only (see [Known Limitations](#known-limitations)).
 
 ```
 ──────────────────────────────────────────────────────────
 
 Resume Session (Current Folder)       ◉ Current Folder | ○ All  Name: All  Sort: Threaded
-Tab scope · re:<pattern> regex · "phrase" exact
+Ctrl+o parents only (off) · Tab scope · re:<pattern> regex · "phrase" exact
 Ctrl+S sort · Ctrl+N named · Ctrl+D delete · Ctrl+P path (off) · Ctrl+R rename
 
 search: fix auth bug_
@@ -143,7 +143,7 @@ See [keybindings.md](https://github.com/earendil-works/pi-coding-agent/blob/main
 
 ### Picker controls
 
-Identical to built-in `/resume`:
+Built-in `/resume` controls, plus a parent-thread filter:
 
 | Key          | Action                                        |
 | ------------ | --------------------------------------------- |
@@ -153,10 +153,17 @@ Identical to built-in `/resume`:
 | `Tab`        | Toggle scope — current project ↔ all sessions |
 | `Ctrl+S`     | Toggle sort — Threaded / Recent / Fuzzy       |
 | `Ctrl+N`     | Toggle name filter — All / Named              |
+| `Ctrl+o`     | Toggle parent threads only                    |
 | `Ctrl+P`     | Toggle session file path display              |
 | `Ctrl+D`     | Delete selected session (with confirmation)   |
 | `Ctrl+R`     | Rename selected session                       |
 | typing       | Filter sessions by text / regex / exact match |
+
+### Parent threads only
+
+Press **Ctrl+o** in the picker to hide child/forked sessions. Press it again to show all threads. The hint shows whether the filter is on. Parent threads are sessions with no `parentSession` in their header, including standalone sessions; a child remains hidden even if its parent is missing or outside the current scope. Sessions without ancestry metadata cannot be identified as children.
+
+The filter works together with search, named-only filtering, sorting, and both scopes. It stays active while rows load and resets when you reopen the picker. Existing configured session shortcuts take priority if rebound to Ctrl+o.
 
 ### Scope
 
